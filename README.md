@@ -1,8 +1,12 @@
 # Plugdeck
 
-Plugdeck is a small private Rust web app for personal self-hosted tools. It is
-intended to sit behind a private network such as a tailnet and provide one
-daily-use site for small built-in modules.
+Plugdeck is a private-first Rust web app for small self-hosted tools. It is
+meant to be the one place where you build and use lightweight modules instead
+of scattering each tiny tool across a separate repository, service, and port.
+
+It is not a replacement for large apps such as Git forges, password managers,
+or media servers. Those should stay as separate services and can be linked from
+Plugdeck.
 
 Current modules:
 
@@ -27,7 +31,7 @@ PLUGDECK_BIND=127.0.0.1:8789
 PLUGDECK_DB=data/plugdeck.sqlite
 PLUGDECK_DOWNLOAD_DIR=data/downloads
 PLUGDECK_LINKS_FILE=plugdeck.local.toml
-PLUGDECK_PASSWORD_HASH=$argon2id$...
+PLUGDECK_PASSWORD_HASH='$argon2id$...'
 PLUGDECK_COOKIE_SECRET=<random hex>
 PLUGDECK_YTDLP=yt-dlp
 PLUGDECK_MAX_ACTIVE=1
