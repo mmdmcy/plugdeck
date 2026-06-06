@@ -1,0 +1,11 @@
+/target/
+/.env
+/plugdeck.local.toml
+/data/
+*.sqlite
+*.sqlite3
+*.db
+*.log
+*.pid
+*.tmp
+*.part
