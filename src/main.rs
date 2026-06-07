@@ -345,7 +345,7 @@ async fn home(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respons
 </section>
 <main class="grid">
   <a class="tile primary" href="/notes"><strong>Notes</strong><span>{} channels · {} notes</span></a>
-  <a class="tile primary" href="/downloads"><strong>Downloads</strong><span>{jobs} active jobs</span></a>
+  <a class="tile primary" href="/downloads"><strong>YTP Downloader</strong><span>{jobs} active jobs</span></a>
   {links}
 </main>
 "#,
@@ -675,14 +675,14 @@ async fn downloads_page(State(state): State<Arc<AppState>>, headers: HeaderMap) 
         .collect::<Vec<_>>()
         .join("");
     page(
-        "Downloads",
+        "YTP Downloader",
         &format!(
             r#"
-<nav><a href="/">Plugdeck</a><strong>Downloads</strong></nav>
+<nav><a href="/">Plugdeck</a><strong>YTP Downloader</strong></nav>
 <main class="download">
   <form action="/downloads" method="post" class="download-form">
     <input name="url" type="url" inputmode="url" placeholder="https://youtu.be/..." required autofocus>
-    <button type="submit">Download</button>
+    <button type="submit">Download Video</button>
   </form>
   <section class="jobs">{jobs_html}</section>
 </main>
@@ -706,8 +706,8 @@ async fn download_create(
     }
     let Ok(url) = normalize_youtube_url(&form.url) else {
         return page(
-            "Downloads",
-            r#"<nav><a href="/">Plugdeck</a><strong>Downloads</strong></nav><main class="download"><p class="error">Only YouTube links are accepted.</p><form action="/downloads" method="post" class="download-form"><input name="url" type="url" inputmode="url" required autofocus><button type="submit">Download</button></form></main>"#,
+            "YTP Downloader",
+            r#"<nav><a href="/">Plugdeck</a><strong>YTP Downloader</strong></nav><main class="download"><p class="error">Only YouTube links are accepted.</p><form action="/downloads" method="post" class="download-form"><input name="url" type="url" inputmode="url" required autofocus><button type="submit">Download Video</button></form></main>"#,
         );
     };
     cleanup_downloads(&state);
@@ -742,10 +742,10 @@ async fn download_job_page(
         return (StatusCode::NOT_FOUND, "unknown job").into_response();
     }
     page(
-        "Download",
+        "YTP Downloader",
         &format!(
             r#"
-<nav><a href="/">Plugdeck</a><a href="/downloads">Downloads</a></nav>
+<nav><a href="/">Plugdeck</a><a href="/downloads">YTP Downloader</a></nav>
 <main class="download">
   <h1 id="state">Preparing</h1>
   <div class="bar"><div id="fill"></div></div>

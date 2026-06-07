@@ -11,7 +11,7 @@ Plugdeck.
 Current modules:
 
 - Notes with channels, messages, and optional image attachments.
-- YouTube downloads through `yt-dlp`.
+- YTP Downloader for YouTube downloads through `yt-dlp`.
 - Links to larger external services.
 
 Plugdeck is not a public internet gateway. Keep it private, use an app password,
