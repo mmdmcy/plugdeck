@@ -37,6 +37,9 @@ PLUGDECK_YTDLP=yt-dlp
 PLUGDECK_MAX_ACTIVE=1
 ```
 
+Keep those values in an ignored `.env`, `plugdeck.local.toml`, or
+`*.local.json` file on your host. Public examples should use placeholders only.
+
 Example links file:
 
 ```toml
@@ -51,4 +54,28 @@ description = "Private Git forge."
 
 ```sh
 cargo run -- import-motehold /path/to/messages.db
+```
+
+## Publishing Safely
+
+Before pushing public changes:
+
+```sh
+cargo fmt --check
+cargo test
+cargo run -- audit-public
+```
+
+For local protection, install the Git hooks:
+
+```sh
+cargo run -- audit-public --install-hook
+```
+
+For host-specific names, domains, or other literal terms that should never be
+published, add one term per line to an ignored denylist:
+
+```text
+docs/private/audit-denylist.txt
+.plugdeck/audit-denylist.txt
 ```
