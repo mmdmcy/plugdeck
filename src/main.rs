@@ -5,7 +5,7 @@ use argon2::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Form, Multipart, Path as AxumPath, State},
+    extract::{Form, Multipart, Path as AxumPath, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -42,6 +42,100 @@ const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_CHANNEL_CHARS: usize = 40;
 const SESSION_COOKIE: &str = "plugdeck_session";
 const SESSION_DAYS: i64 = 30;
+const PAGE_CSS: &str = r#"
+:root{color-scheme:light dark;--bg:#f6f7f5;--fg:#161816;--muted:#68706a;--line:#d7dcd5;--panel:#fff;--accent:#0d6b57;--accent-soft:#e3f1ec;--accent2:#315f9f;--danger:#ad2f28}
+@media(prefers-color-scheme:dark){:root{--bg:#101211;--fg:#f4f5ef;--muted:#a2aaa4;--line:#323934;--panel:#171b18;--accent:#55b59c;--accent-soft:#19362f;--accent2:#8fb5f2;--danger:#ff8a7d}}
+*{box-sizing:border-box}
+html,body{min-height:100%}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:0}
+a{color:inherit;text-decoration:none}
+button,input,select,textarea{font:inherit}
+button,.button{min-height:42px;border:0;border-radius:7px;background:var(--accent);color:#fff;padding:0 15px;font-weight:700;cursor:pointer}
+.ghost,.icon{background:transparent;color:var(--fg);border:1px solid var(--line)}
+.icon{width:34px;min-height:34px;padding:0}
+.danger-icon{color:var(--danger)}
+input,select,textarea{width:100%;border:1px solid var(--line);border-radius:7px;background:transparent;color:var(--fg);padding:11px}
+textarea{min-height:110px;resize:vertical}
+nav,.hero{height:64px;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:0 20px;border-bottom:1px solid var(--line)}
+nav a{color:var(--accent2);font-weight:700}
+h1{font-size:28px;line-height:1.1;margin:0}
+main{width:min(1180px,calc(100% - 32px));margin:0 auto;padding:18px 0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}
+.tile,.download section{border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:14px}
+.tile{min-height:96px;display:flex;flex-direction:column;justify-content:space-between}
+.tile.primary{border-color:var(--accent)}
+.tile strong{font-size:18px}
+.tile span,.muted{color:var(--muted)}
+.split{display:grid;grid-template-columns:minmax(210px,280px) minmax(0,1fr);gap:14px}
+.stack{display:grid;gap:10px}
+.list{display:grid;gap:8px;margin-top:14px}
+.row,.note-head{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.notes{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-top:14px}
+.note p{white-space:normal;word-break:break-word;line-height:1.45}
+.note img{max-width:100%;border-radius:6px;border:1px solid var(--line)}
+.chat-shell{width:min(1180px,calc(100% - 32px));height:calc(100svh - 64px);padding:12px 0;display:grid;grid-template-columns:240px minmax(0,1fr);gap:12px;min-width:0}
+.channel-rail,.chat-pane{min-width:0;min-height:0;border:1px solid var(--line);background:var(--panel);border-radius:8px}
+.channel-rail{padding:12px;display:flex;flex-direction:column;gap:10px;overflow:hidden}
+.rail-title{font-size:12px;font-weight:800;color:var(--muted);text-transform:uppercase}
+.channel-list{display:grid;gap:6px;overflow:auto}
+.channel-row{display:grid;grid-template-columns:minmax(0,1fr) 34px;gap:6px;align-items:center}
+.channel-link{min-height:38px;display:flex;align-items:center;gap:6px;min-width:0;border-radius:6px;padding:0 10px;color:var(--muted);font-weight:700;overflow:hidden;text-overflow:ellipsis}
+.channel-link span{color:var(--muted)}
+.channel-row.active .channel-link{background:var(--accent-soft);color:var(--fg)}
+.channel-row .icon{opacity:.75}
+.channel-add{border-top:1px solid var(--line);padding-top:10px}
+.channel-add summary{min-height:38px;display:flex;align-items:center;color:var(--accent2);font-weight:800;cursor:pointer;list-style:none}
+.channel-add summary::-webkit-details-marker{display:none}
+.channel-form{display:grid;gap:8px;margin-top:8px}
+.chat-pane{display:grid;grid-template-rows:auto minmax(0,1fr) auto;overflow:hidden}
+.chat-head{min-height:54px;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 16px;border-bottom:1px solid var(--line)}
+.chat-head strong{font-size:17px}
+.chat-head span{color:var(--muted)}
+.message-list{min-height:0;overflow:auto;padding:16px;display:grid;align-content:end;gap:2px}
+.message{display:grid;grid-template-columns:38px minmax(0,1fr);gap:10px;padding:8px 0}
+.message-avatar{width:38px;height:38px;border-radius:50%;display:grid;place-items:center;background:var(--accent-soft);color:var(--accent);font-weight:900}
+.message-body{min-width:0}
+.message-meta{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:34px}
+.message-meta form{opacity:0}
+.message:hover .message-meta form,.message:focus-within .message-meta form{opacity:1}
+.message p{margin:4px 0 0;white-space:normal;word-break:break-word;line-height:1.45}
+.message-image{display:block;max-width:min(420px,100%);border-radius:6px;border:1px solid var(--line);margin-top:8px}
+.empty{align-self:center;justify-self:center;color:var(--muted);text-align:center}
+.composer{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:8px;padding:12px;border-top:1px solid var(--line);background:var(--panel);min-width:0}
+.composer textarea{min-height:46px;max-height:36svh;resize:vertical}
+.composer button{white-space:nowrap}
+.file-pill{position:relative;min-height:42px;border:1px solid var(--line);border-radius:7px;padding:0 13px;display:flex;align-items:center;justify-content:center;color:var(--fg);font-weight:700;cursor:pointer;overflow:hidden}
+.file-pill input{position:absolute;inset:0;opacity:0;cursor:pointer}
+.login{width:min(420px,calc(100% - 32px));padding-top:72px}
+.login form,.download-form{display:grid;gap:10px;margin-top:18px}
+.error{color:var(--danger);font-weight:700}
+.download{max-width:760px}
+.jobs{display:grid;gap:8px;margin-top:14px}
+.job{display:flex;justify-content:space-between;gap:12px;border-bottom:1px solid var(--line);padding:10px 0}
+.job span{color:var(--muted)}
+.bar{height:12px;border:1px solid var(--line);border-radius:999px;overflow:hidden;margin:18px 0}
+#fill{height:100%;width:6%;background:var(--accent)}
+pre{white-space:pre-wrap;word-break:break-word;color:var(--muted);max-height:44vh;overflow:auto;border-top:1px solid var(--line);padding-top:12px}
+@media(max-width:760px){
+  nav,.hero{padding:0 14px}
+  main{width:calc(100% - 20px)}
+  .chat-shell{width:100%;height:calc(100svh - 64px);padding:0;gap:0;grid-template-columns:1fr;grid-template-rows:auto minmax(0,1fr)}
+  .channel-rail{border-width:0 0 1px;border-radius:0;padding:10px;display:grid;grid-template-rows:auto auto auto;gap:8px;max-height:34svh}
+  .channel-list{display:flex;gap:8px;overflow-x:auto;overflow-y:hidden;padding-bottom:2px}
+  .channel-row{display:flex;flex:0 0 auto}
+  .channel-link{white-space:nowrap}
+  .channel-row .icon{display:none}
+  .channel-add{padding-top:8px}
+  .chat-pane{border:0;border-radius:0}
+  .chat-head{min-height:48px;padding:0 12px}
+  .message-list{padding:10px 12px}
+  .message{grid-template-columns:32px minmax(0,1fr);gap:8px}
+  .message-avatar{width:32px;height:32px}
+  .composer{grid-template-columns:minmax(0,1fr) 88px;padding:10px}
+  .composer textarea{grid-column:1/-1;min-height:56px}
+  .file-pill{min-width:0}
+}
+"#;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -438,71 +532,137 @@ async fn logout_post() -> Response {
         .into_response()
 }
 
-async fn notes_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+#[derive(Deserialize)]
+struct NotesQuery {
+    channel: Option<i64>,
+}
+
+async fn notes_page(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<NotesQuery>,
+    headers: HeaderMap,
+) -> Response {
     if let Some(response) = page_guard(&state, &headers) {
         return response;
     }
-    let (channels, notes) = {
+    let channels = {
         let db = state.db.lock().unwrap();
-        (
-            list_channels(&db).unwrap_or_default(),
-            list_notes(&db, None).unwrap_or_default(),
-        )
+        list_channels(&db).unwrap_or_default()
+    };
+    let active_channel = channels
+        .iter()
+        .find(|channel| Some(channel.id) == query.channel)
+        .or_else(|| channels.first());
+    let active_channel_id = active_channel.map(|channel| channel.id).unwrap_or(1);
+    let active_channel_name = active_channel
+        .map(|channel| channel.name.as_str())
+        .unwrap_or(DEFAULT_CHANNEL);
+    let notes = {
+        let db = state.db.lock().unwrap();
+        list_notes(&db, Some(active_channel_id)).unwrap_or_default()
     };
     let channels_html = channels
         .iter()
         .map(|channel| {
-            format!(
-                r#"<div class="row"><span>{}</span><form action="/notes/channels/{}/delete" method="post"><button class="icon" type="submit">×</button></form></div>"#,
-                html_escape(&channel.name),
-                channel.id
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
-    let notes_html = notes
-        .iter()
-        .map(|note| {
-            let image = if note.has_image {
-                format!(r#"<img src="/notes/images/{}" alt="">"#, note.id)
+            let active_class = if channel.id == active_channel_id {
+                " active"
+            } else {
+                ""
+            };
+            let channel_name = html_escape(&channel.name);
+            let delete = if channels.len() > 1 {
+                format!(
+                    r#"<form action="/notes/channels/{}/delete" method="post"><button class="icon danger-icon" type="submit" aria-label="Delete channel {}">x</button></form>"#,
+                    channel.id, channel_name
+                )
             } else {
                 String::new()
             };
             format!(
-                r#"<article class="note"><div class="note-head"><span>{}</span><form action="/notes/{}/delete" method="post"><button class="icon" type="submit">×</button></form></div><p>{}</p>{}</article>"#,
-                html_escape(&note.channel),
-                note.id,
-                html_escape(&note.body).replace('\n', "<br>"),
-                image
+                r##"<div class="channel-row{active_class}"><a class="channel-link" href="/notes?channel={}"><span>#</span>{}</a>{}</div>"##,
+                channel.id, channel_name, delete
             )
         })
         .collect::<Vec<_>>()
         .join("");
+    let active_channel_label = html_escape(active_channel_name);
+    let notes_html = if notes.is_empty() {
+        format!(
+            r##"<p class="empty">No messages in #{} yet.</p>"##,
+            active_channel_label
+        )
+    } else {
+        notes
+            .iter()
+            .rev()
+            .map(|note| {
+                let body = if note.body.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        r#"<p>{}</p>"#,
+                        html_escape(&note.body).replace('\n', "<br>")
+                    )
+                };
+                let image = if note.has_image {
+                    format!(
+                        r#"<img class="message-image" src="/notes/images/{}" alt="">"#,
+                        note.id
+                    )
+                } else {
+                    String::new()
+                };
+                format!(
+                    r##"<article class="message">
+  <div class="message-avatar">#</div>
+  <div class="message-body">
+    <div class="message-meta"><strong>{}</strong><form action="/notes/{}/delete" method="post"><button class="icon danger-icon" type="submit" aria-label="Delete message">x</button></form></div>
+    {}{}
+  </div>
+</article>"##,
+                    html_escape(&note.channel),
+                    note.id,
+                    body,
+                    image
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let message_count = notes.len();
     page(
         "Notes",
         &format!(
             r#"
 <nav><a href="/">Plugdeck</a><strong>Notes</strong></nav>
-<main class="split">
-  <aside>
-    <form action="/notes/channels" method="post" class="stack">
-      <input name="name" maxlength="{MAX_CHANNEL_CHARS}" placeholder="Channel" required>
-      <button type="submit">Add</button>
-    </form>
-    <div class="list">{channels_html}</div>
+<main class="chat-shell">
+  <aside class="channel-rail" aria-label="Channels">
+    <div class="rail-title">Channels</div>
+    <div class="channel-list">{channels_html}</div>
+    <details class="channel-add">
+      <summary>Add channel</summary>
+      <form action="/notes/channels" method="post" class="channel-form">
+        <input name="name" maxlength="{MAX_CHANNEL_CHARS}" placeholder="Channel name" required>
+        <button type="submit">Add</button>
+      </form>
+    </details>
   </aside>
-  <section>
-    <form action="/notes" method="post" enctype="multipart/form-data" class="stack">
-      <select name="channel_id">{}</select>
-      <textarea name="body" maxlength="{MAX_NOTE_CHARS}" placeholder="Note"></textarea>
-      <input name="image" type="file" accept="image/png,image/jpeg,image/gif,image/webp">
-      <button type="submit">Save</button>
+  <section class="chat-pane">
+    <header class="chat-head"><strong># {active_channel_label}</strong><span>{message_count} messages</span></header>
+    <div class="message-list">{notes_html}</div>
+    <form action="/notes" method="post" enctype="multipart/form-data" class="composer">
+      <input name="channel_id" type="hidden" value="{active_channel_id}">
+      <textarea name="body" maxlength="{MAX_NOTE_CHARS}" placeholder="Message #{active_channel_label}"></textarea>
+      <label class="file-pill"><input name="image" type="file" accept="image/png,image/jpeg,image/gif,image/webp"><span>Image</span></label>
+      <button type="submit">Send</button>
     </form>
-    <div class="notes">{notes_html}</div>
   </section>
 </main>
-"#,
-            channel_options(&channels, None)
+<script>
+const messages = document.querySelector(".message-list");
+if (messages) messages.scrollTop = messages.scrollHeight;
+</script>
+"#
         ),
     )
 }
@@ -521,11 +681,12 @@ async fn channel_create(
         return response;
     }
     let name = form.name.trim();
+    let mut channel_id = None;
     if !name.is_empty() && name.chars().count() <= MAX_CHANNEL_CHARS {
         let db = state.db.lock().unwrap();
-        let _ = ensure_channel(&db, name);
+        channel_id = ensure_channel(&db, name).ok();
     }
-    Redirect::to("/notes").into_response()
+    Redirect::to(&notes_location(channel_id)).into_response()
 }
 
 async fn channel_delete(
@@ -543,7 +704,7 @@ async fn channel_delete(
     if channel_count > 1 {
         let _ = db.execute("DELETE FROM channels WHERE id = ?1", params![id]);
     }
-    Redirect::to("/notes").into_response()
+    Redirect::to(&notes_location(None)).into_response()
 }
 
 async fn note_create(
@@ -588,8 +749,8 @@ async fn note_create(
     }
 
     let body = body.trim();
+    let channel_id = channel_id.unwrap_or(1);
     if (!body.is_empty() || image_data.is_some()) && body.len() <= MAX_NOTE_CHARS {
-        let channel_id = channel_id.unwrap_or(1);
         let db = state.db.lock().unwrap();
         let exists = db
             .query_row(
@@ -607,7 +768,7 @@ async fn note_create(
             );
         }
     }
-    Redirect::to("/notes").into_response()
+    Redirect::to(&notes_location(Some(channel_id))).into_response()
 }
 
 async fn note_delete(
@@ -619,8 +780,16 @@ async fn note_delete(
         return response;
     }
     let db = state.db.lock().unwrap();
+    let channel_id = db
+        .query_row(
+            "SELECT channel_id FROM notes WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .unwrap_or(None);
     let _ = db.execute("DELETE FROM notes WHERE id = ?1", params![id]);
-    Redirect::to("/notes").into_response()
+    Redirect::to(&notes_location(channel_id)).into_response()
 }
 
 async fn note_image(
@@ -1349,24 +1518,11 @@ fn render_links(links: &[Link]) -> String {
         .join("")
 }
 
-fn channel_options(channels: &[ChannelRow], selected: Option<i64>) -> String {
-    channels
-        .iter()
-        .map(|channel| {
-            let selected_attr = if Some(channel.id) == selected {
-                " selected"
-            } else {
-                ""
-            };
-            format!(
-                r#"<option value="{}"{}>{}</option>"#,
-                channel.id,
-                selected_attr,
-                html_escape(&channel.name)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("")
+fn notes_location(channel_id: Option<i64>) -> String {
+    channel_id
+        .filter(|id| *id > 0)
+        .map(|id| format!("/notes?channel={id}"))
+        .unwrap_or_else(|| "/notes".into())
 }
 
 fn page(title: &str, body: &str) -> Response {
@@ -1378,9 +1534,7 @@ fn page(title: &str, body: &str) -> Response {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{}</title>
 <style>
-:root{{color-scheme:light dark;--bg:#f6f7f5;--fg:#161816;--muted:#68706a;--line:#d7dcd5;--panel:#fff;--accent:#0d6b57;--accent2:#315f9f;--danger:#ad2f28}}
-@media(prefers-color-scheme:dark){{:root{{--bg:#101211;--fg:#f4f5ef;--muted:#a2aaa4;--line:#323934;--panel:#171b18;--accent:#55b59c;--accent2:#8fb5f2;--danger:#ff8a7d}}}}
-*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--fg);font:15px system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:0}}a{{color:inherit;text-decoration:none}}button,input,select,textarea{{font:inherit}}button,.button{{min-height:42px;border:0;border-radius:7px;background:var(--accent);color:#fff;padding:0 15px;font-weight:700;cursor:pointer}}.ghost,.icon{{background:transparent;color:var(--fg);border:1px solid var(--line)}}.icon{{width:34px;min-height:34px;padding:0}}input,select,textarea{{width:100%;border:1px solid var(--line);border-radius:7px;background:transparent;color:var(--fg);padding:11px}}textarea{{min-height:110px;resize:vertical}}nav,.hero{{height:64px;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:0 20px;border-bottom:1px solid var(--line)}}nav a{{color:var(--accent2);font-weight:700}}h1{{font-size:28px;line-height:1.1;margin:0}}main{{width:min(1180px,calc(100% - 32px));margin:0 auto;padding:18px 0}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}}.tile,.note,aside,.download section{{border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:14px}}.tile{{min-height:96px;display:flex;flex-direction:column;justify-content:space-between}}.tile.primary{{border-color:var(--accent)}}.tile strong{{font-size:18px}}.tile span,.muted{{color:var(--muted)}}.split{{display:grid;grid-template-columns:minmax(210px,280px) minmax(0,1fr);gap:14px}}.stack{{display:grid;gap:10px}}.list{{display:grid;gap:8px;margin-top:14px}}.row,.note-head{{display:flex;align-items:center;justify-content:space-between;gap:10px}}.notes{{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-top:14px}}.note p{{white-space:normal;word-break:break-word;line-height:1.45}}.note img{{max-width:100%;border-radius:6px;border:1px solid var(--line)}}.login{{width:min(420px,calc(100% - 32px));padding-top:72px}}.login form,.download-form{{display:grid;gap:10px;margin-top:18px}}.error{{color:var(--danger);font-weight:700}}.download{{max-width:760px}}.jobs{{display:grid;gap:8px;margin-top:14px}}.job{{display:flex;justify-content:space-between;gap:12px;border-bottom:1px solid var(--line);padding:10px 0}}.job span{{color:var(--muted)}}.bar{{height:12px;border:1px solid var(--line);border-radius:999px;overflow:hidden;margin:18px 0}}#fill{{height:100%;width:6%;background:var(--accent)}}pre{{white-space:pre-wrap;word-break:break-word;color:var(--muted);max-height:44vh;overflow:auto;border-top:1px solid var(--line);padding-top:12px}}@media(max-width:760px){{.split{{grid-template-columns:1fr}}nav,.hero{{padding:0 14px}}main{{width:calc(100% - 20px)}}}}
+{PAGE_CSS}
 </style>
 </head>
 <body>{}</body>
