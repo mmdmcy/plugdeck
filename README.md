@@ -11,6 +11,7 @@ Plugdeck.
 Current modules:
 
 - Notes with channels, messages, and optional image attachments.
+- Agents with addable Codex slots, command shortcuts, and file/photo uploads.
 - YTP Downloader for YouTube downloads through `yt-dlp`.
 - Links to larger external services.
 
@@ -30,6 +31,11 @@ Local config can be supplied with environment variables:
 PLUGDECK_BIND=127.0.0.1:8789
 PLUGDECK_DB=data/plugdeck.sqlite
 PLUGDECK_DOWNLOAD_DIR=data/downloads
+PLUGDECK_AGENT_DEFAULT_WORKDIR=~
+PLUGDECK_AGENT_UPLOAD_DIR=data/agent-uploads
+PLUGDECK_AGENT_SLOTS=a,b,c
+PLUGDECK_AGENT_CODEX_BIN=codex
+PLUGDECK_AGENT_CODEX_ARGS=
 PLUGDECK_LINKS_FILE=plugdeck.local.toml
 PLUGDECK_PASSWORD_HASH='$argon2id$...'
 PLUGDECK_COOKIE_SECRET=<random hex>
@@ -49,6 +55,20 @@ url = "http://127.0.0.1:3000"
 category = "Code"
 description = "Private Git forge."
 ```
+
+## Adding Modules
+
+Plugdeck modules are small Rust web apps that share auth, styling, SQLite state,
+and the home menu. Add new module wiring in `src/modules.rs`:
+
+- add a `PlugdeckModule` entry with a name, path, stats function, and route
+  registration function
+- keep module state in generic SQLite tables created from `open_db`
+- keep local paths, secrets, service names, and machine-specific settings in
+  ignored config files, not tracked source
+
+The existing Notes, Agents, and YTP Downloader modules are the reference
+patterns for forms, uploads, background jobs, and home menu stats.
 
 ## Import Motehold
 

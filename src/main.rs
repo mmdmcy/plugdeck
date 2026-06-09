@@ -3,12 +3,11 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
 use axum::{
-    Json, Router,
+    Json,
     body::Body,
     extract::{Form, Multipart, Path as AxumPath, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{get, post},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Duration, Utc};
@@ -30,16 +29,22 @@ use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command as TokioCommand,
-    sync::Semaphore,
+    sync::{Semaphore, oneshot},
 };
 use tokio_util::io::ReaderStream;
 use url::Url;
 use uuid::Uuid;
 
+mod modules;
+
 const DEFAULT_CHANNEL: &str = "general";
+const DEFAULT_AGENT_SLOT: &str = "a";
 const MAX_NOTE_CHARS: usize = 256 * 1024;
 const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+const MAX_AGENT_MESSAGE_CHARS: usize = 128 * 1024;
+const MAX_AGENT_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
 const MAX_CHANNEL_CHARS: usize = 40;
+const MAX_AGENT_SLOT_CHARS: usize = 32;
 const SESSION_COOKIE: &str = "plugdeck_session";
 const SESSION_DAYS: i64 = 30;
 const PAGE_CSS: &str = r#"
@@ -49,7 +54,7 @@ const PAGE_CSS: &str = r#"
 html,body{min-height:100%}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:0}
 a{color:inherit;text-decoration:none}
-button,input,select,textarea{font:inherit}
+button,input,select,textarea{font:inherit;font-size:16px}
 button,.button{min-height:42px;border:0;border-radius:7px;background:var(--accent);color:#fff;padding:0 15px;font-weight:700;cursor:pointer}
 .ghost,.icon{background:transparent;color:var(--fg);border:1px solid var(--line)}
 .icon{width:34px;min-height:34px;padding:0}
@@ -106,6 +111,16 @@ main{width:min(1180px,calc(100% - 32px));margin:0 auto;padding:18px 0}
 .composer button{white-space:nowrap}
 .file-pill{position:relative;min-height:42px;border:1px solid var(--line);border-radius:7px;padding:0 13px;display:flex;align-items:center;justify-content:center;color:var(--fg);font-weight:700;cursor:pointer;overflow:hidden}
 .file-pill input{position:absolute;inset:0;opacity:0;cursor:pointer}
+.agent-shell{height:calc(100dvh - 64px)}
+.agent-pane{grid-template-rows:auto minmax(0,1fr) auto}
+.agent-status{color:var(--muted);font-weight:700;font-size:13px;white-space:nowrap}
+.agent-compose-wrap{border-top:1px solid var(--line);background:var(--panel)}
+.agent-quick{display:flex;gap:7px;overflow-x:auto;padding:10px 12px 0;scrollbar-width:thin}
+.agent-quick button{flex:0 0 auto;min-width:max-content;min-height:36px;padding:0 11px;white-space:nowrap}
+.agent-composer{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:8px;padding:10px 12px 12px;min-width:0}
+.agent-composer textarea{min-height:52px;max-height:30dvh;resize:vertical}
+.attachment-link{display:inline-flex;align-items:center;min-height:34px;border:1px solid var(--line);border-radius:6px;padding:0 9px;margin-top:8px;color:var(--accent2);font-weight:800;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.message-log{color:var(--muted);font-size:13px}
 .login{width:min(420px,calc(100% - 32px));padding-top:72px}
 .login form,.download-form{display:grid;gap:10px;margin-top:18px}
 .error{color:var(--danger);font-weight:700}
@@ -133,6 +148,11 @@ pre{white-space:pre-wrap;word-break:break-word;color:var(--muted);max-height:44v
   .message-avatar{width:32px;height:32px}
   .composer{grid-template-columns:minmax(0,1fr) 88px;padding:10px}
   .composer textarea{grid-column:1/-1;min-height:56px}
+  .agent-shell{height:calc(100dvh - 64px)}
+  .agent-quick{padding:8px 10px 0}
+  .agent-composer{grid-template-columns:minmax(0,1fr) 86px;padding:8px 10px max(10px,env(safe-area-inset-bottom))}
+  .agent-composer textarea{grid-column:1/-1;min-height:54px;max-height:26dvh}
+  .agent-composer .file-pill{min-width:0}
   .file-pill{min-width:0}
 }
 "#;
@@ -174,32 +194,24 @@ async fn main() -> io::Result<()> {
 
 async fn serve() -> io::Result<()> {
     let config = Config::from_env()?;
-    let conn = open_db(&config.db_path)?;
     fs::create_dir_all(&config.download_dir)?;
+    fs::create_dir_all(&config.agent_upload_dir)?;
+    let conn = open_db(&config.db_path)?;
+    ensure_agent_slot_seeds(&conn, &config.agent_slots, &config.agent_default_workdir)
+        .map_err(io_other)?;
 
     let state = Arc::new(AppState {
         db: Mutex::new(conn),
         config,
         jobs: Mutex::new(HashMap::new()),
         download_slots: Semaphore::new(1),
+        agent_jobs: Mutex::new(HashMap::new()),
+        agent_cancels: Mutex::new(HashMap::new()),
     });
 
     state.set_download_slots();
 
-    let app = Router::new()
-        .route("/", get(home))
-        .route("/login", get(login_page).post(login_post))
-        .route("/logout", post(logout_post))
-        .route("/notes", get(notes_page).post(note_create))
-        .route("/notes/channels", post(channel_create))
-        .route("/notes/channels/{id}/delete", post(channel_delete))
-        .route("/notes/{id}/delete", post(note_delete))
-        .route("/notes/images/{id}", get(note_image))
-        .route("/downloads", get(downloads_page).post(download_create))
-        .route("/downloads/jobs/{id}", get(download_job_page))
-        .route("/downloads/jobs/{id}/status", get(download_job_status))
-        .route("/downloads/jobs/{id}/file", get(download_file))
-        .with_state(state.clone());
+    let app = modules::build_router(state.clone());
 
     let bind = state
         .config
@@ -216,6 +228,11 @@ struct Config {
     bind: String,
     db_path: PathBuf,
     download_dir: PathBuf,
+    agent_default_workdir: PathBuf,
+    agent_upload_dir: PathBuf,
+    agent_codex_bin: String,
+    agent_codex_args: Vec<String>,
+    agent_slots: Vec<AgentSlotSeed>,
     ytdlp: String,
     js_runtime: Option<PathBuf>,
     max_active: usize,
@@ -225,6 +242,19 @@ struct Config {
     cookie_secret: Vec<u8>,
     auth_disabled: bool,
     links: Vec<Link>,
+}
+
+#[derive(Clone)]
+struct AgentSlotSeed {
+    name: String,
+    workdir: PathBuf,
+}
+
+#[derive(Clone, Serialize)]
+struct AgentRun {
+    status: String,
+    current: String,
+    started_at: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -259,6 +289,22 @@ impl Config {
         let download_dir = env::var("PLUGDECK_DOWNLOAD_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("data/downloads"));
+        let agent_default_workdir = env::var("PLUGDECK_AGENT_DEFAULT_WORKDIR")
+            .map(|value| expand_local_path(&value))
+            .unwrap_or_else(|_| default_home_dir());
+        let agent_upload_dir = env::var("PLUGDECK_AGENT_UPLOAD_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| download_dir.join("agent-uploads"));
+        let agent_codex_bin =
+            env::var("PLUGDECK_AGENT_CODEX_BIN").unwrap_or_else(|_| "codex".into());
+        let agent_codex_args = env::var("PLUGDECK_AGENT_CODEX_ARGS")
+            .ok()
+            .map(|value| split_env_args(&value))
+            .unwrap_or_default();
+        let agent_slots = parse_agent_slot_seeds(
+            env::var("PLUGDECK_AGENT_SLOTS").ok(),
+            &agent_default_workdir,
+        );
         let ytdlp = env::var("PLUGDECK_YTDLP").unwrap_or_else(|_| "yt-dlp".into());
         let js_runtime = env::var("PLUGDECK_JS_RUNTIME")
             .ok()
@@ -303,6 +349,11 @@ impl Config {
             bind,
             db_path,
             download_dir,
+            agent_default_workdir,
+            agent_upload_dir,
+            agent_codex_bin,
+            agent_codex_args,
+            agent_slots,
             ytdlp,
             js_runtime,
             max_active,
@@ -321,6 +372,8 @@ struct AppState {
     config: Config,
     jobs: Mutex<HashMap<String, Job>>,
     download_slots: Semaphore,
+    agent_jobs: Mutex<HashMap<i64, AgentRun>>,
+    agent_cancels: Mutex<HashMap<i64, oneshot::Sender<()>>>,
 }
 
 impl AppState {
@@ -404,6 +457,42 @@ fn open_db(path: &Path) -> io::Result<Connection> {
             filename TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS agent_slots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+            workdir TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS agent_sessions (
+            slot_id INTEGER PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            workdir TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (slot_id) REFERENCES agent_slots(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS agent_attachments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slot_id INTEGER NOT NULL,
+            original_name TEXT NOT NULL,
+            stored_name TEXT NOT NULL,
+            content_type TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (slot_id) REFERENCES agent_slots(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS agent_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slot_id INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            body TEXT NOT NULL,
+            attachment_id INTEGER,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (slot_id) REFERENCES agent_slots(id) ON DELETE CASCADE,
+            FOREIGN KEY (attachment_id) REFERENCES agent_attachments(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_messages_slot_id ON agent_messages(slot_id, id);
+        CREATE INDEX IF NOT EXISTS idx_agent_attachments_slot_id ON agent_attachments(slot_id);
         "#,
     )
     .map_err(io_other)?;
@@ -433,17 +522,7 @@ async fn home(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respons
     if let Some(response) = page_guard(&state, &headers) {
         return response;
     }
-    let stats = {
-        let db = state.db.lock().unwrap();
-        let channels: i64 = db
-            .query_row("SELECT COUNT(*) FROM channels", [], |row| row.get(0))
-            .unwrap_or(0);
-        let notes: i64 = db
-            .query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))
-            .unwrap_or(0);
-        (channels, notes)
-    };
-    let jobs = state.jobs.lock().unwrap().len();
+    let modules = modules::module_tiles(&state);
     let links = render_links(&state.config.links);
     page(
         "Plugdeck",
@@ -454,12 +533,10 @@ async fn home(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respons
   <form action="/logout" method="post"><button class="ghost" type="submit">Log out</button></form>
 </section>
 <main class="grid">
-  <a class="tile primary" href="/notes"><strong>Notes</strong><span>{} channels · {} notes</span></a>
-  <a class="tile primary" href="/downloads"><strong>YTP Downloader</strong><span>{jobs} active jobs</span></a>
+  {modules}
   {links}
 </main>
-"#,
-            stats.0, stats.1
+"#
         ),
     )
 }
@@ -831,6 +908,1202 @@ async fn note_image(
         .into_response()
 }
 
+#[derive(Deserialize)]
+struct AgentsQuery {
+    slot: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct AgentSlotForm {
+    name: String,
+    workdir: Option<String>,
+}
+
+struct PendingUpload {
+    filename: String,
+    content_type: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct AgentSlotRow {
+    id: i64,
+    name: String,
+    workdir: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AgentAttachmentSummary {
+    id: i64,
+    name: String,
+    content_type: String,
+    size_bytes: i64,
+    is_image: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AgentMessageRow {
+    role: String,
+    body: String,
+    created_at: String,
+    attachment: Option<AgentAttachmentSummary>,
+}
+
+#[derive(Serialize)]
+struct AgentSlotPoll {
+    running: bool,
+    current: String,
+    message_count: usize,
+    messages_html: String,
+}
+
+async fn agents_page(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<AgentsQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = page_guard(&state, &headers) {
+        return response;
+    }
+    let slots = {
+        let db = state.db.lock().unwrap();
+        list_agent_slots(&db).unwrap_or_default()
+    };
+    let active_slot = slots
+        .iter()
+        .find(|slot| Some(slot.id) == query.slot)
+        .or_else(|| slots.first());
+    let Some(active_slot) = active_slot else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "missing agent slot").into_response();
+    };
+    let messages = {
+        let db = state.db.lock().unwrap();
+        list_agent_messages(&db, active_slot.id).unwrap_or_default()
+    };
+    let run = agent_run_for(&state, active_slot.id);
+    let status_text = run
+        .as_ref()
+        .map(|run| {
+            if run.current.trim().is_empty() {
+                run.status.clone()
+            } else {
+                run.current.clone()
+            }
+        })
+        .unwrap_or_else(|| "idle".into());
+    let slots_html = agent_slots_html(&slots, active_slot.id);
+    let messages_html = agent_messages_html(&messages);
+    let active_slot_name = html_escape(&active_slot.name);
+    let message_count = messages.len();
+    page(
+        "Agents",
+        &format!(
+            r##"
+<nav><a href="/">Plugdeck</a><strong>Agents</strong></nav>
+<main class="chat-shell agent-shell">
+  <aside class="channel-rail" aria-label="Slots">
+    <div class="rail-title">Slots</div>
+    <div class="channel-list">{slots_html}</div>
+    <details class="channel-add">
+      <summary>Add slot</summary>
+      <form action="/agents/slots" method="post" class="channel-form">
+        <input name="name" maxlength="{MAX_AGENT_SLOT_CHARS}" placeholder="a" required>
+        <input name="workdir" placeholder="Folder">
+        <button type="submit">Add</button>
+      </form>
+    </details>
+  </aside>
+  <section class="chat-pane agent-pane">
+    <header class="chat-head"><strong># {active_slot_name}</strong><span data-agent-count>{message_count} messages</span><span class="agent-status" data-agent-status>{}</span></header>
+    <div class="message-list" data-agent-messages>{messages_html}</div>
+    <section class="agent-compose-wrap">
+      <div class="agent-quick">
+        <button type="button" data-agent-cmd="!status">status</button>
+        <button type="button" data-agent-cmd="!pwd">pwd</button>
+        <button type="button" data-agent-cmd="!ls">ls</button>
+        <button type="button" data-agent-cmd="!slots">slots</button>
+        <button type="button" data-agent-cmd="!fresh">fresh</button>
+        <button type="button" data-agent-cmd="!stayfresh">stayfresh</button>
+        <button type="button" data-agent-cmd="!stop">stop</button>
+      </div>
+      <form action="/agents" method="post" enctype="multipart/form-data" class="agent-composer">
+        <input name="slot_id" type="hidden" value="{}">
+        <textarea id="agentBody" name="body" maxlength="{MAX_AGENT_MESSAGE_CHARS}" placeholder="Message #{active_slot_name}"></textarea>
+        <label class="file-pill"><input name="attachment" type="file" accept="image/*,.pdf,.txt,.md,.csv,.json,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip,application/pdf,text/*"><span>Attach</span></label>
+        <button type="submit">Send</button>
+      </form>
+    </section>
+  </section>
+</main>
+<script>
+(() => {{
+  const list = document.querySelector("[data-agent-messages]");
+  const status = document.querySelector("[data-agent-status]");
+  const count = document.querySelector("[data-agent-count]");
+  const input = document.getElementById("agentBody");
+  document.querySelectorAll("[data-agent-cmd]").forEach((button) => {{
+    button.addEventListener("click", () => {{
+      input.value = button.dataset.agentCmd || "";
+      try {{ input.focus({{preventScroll:true}}); }} catch (_) {{ input.focus(); }}
+    }});
+  }});
+  let dirty = false;
+  input.addEventListener("input", () => {{ dirty = input.value.length > 0; }});
+  input.addEventListener("focus", () => setTimeout(() => input.scrollIntoView({{block:"nearest"}}), 80));
+  async function poll() {{
+    if (!list || dirty || document.activeElement === input) {{
+      setTimeout(poll, 1800);
+      return;
+    }}
+    const nearBottom = list.scrollTop + list.clientHeight >= list.scrollHeight - 90;
+    try {{
+      const response = await fetch("/agents/slots/{}/state", {{cache:"no-store"}});
+      if (response.ok) {{
+        const data = await response.json();
+        list.innerHTML = data.messages_html;
+        status.textContent = data.running ? (data.current || "running") : "idle";
+        count.textContent = data.message_count + " messages";
+        if (nearBottom) list.scrollTop = list.scrollHeight;
+        setTimeout(poll, data.running ? 1200 : 4000);
+        return;
+      }}
+    }} catch (_) {{}}
+    setTimeout(poll, 4000);
+  }}
+  if (list) list.scrollTop = list.scrollHeight;
+  setTimeout(poll, 1200);
+}})();
+</script>
+"##,
+            html_escape(&status_text),
+            active_slot.id,
+            active_slot.id
+        ),
+    )
+}
+
+async fn agent_slot_create(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<AgentSlotForm>,
+) -> Response {
+    if let Some(response) = page_guard(&state, &headers) {
+        return response;
+    }
+    let name = normalize_agent_slot_name(&form.name);
+    let workdir = form
+        .workdir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(expand_local_path)
+        .unwrap_or_else(|| state.config.agent_default_workdir.clone());
+    let mut slot_id = None;
+    if !name.is_empty() && name.chars().count() <= MAX_AGENT_SLOT_CHARS && workdir.is_dir() {
+        let db = state.db.lock().unwrap();
+        slot_id = ensure_agent_slot(&db, &name, &workdir).ok();
+    }
+    Redirect::to(&agent_location(slot_id)).into_response()
+}
+
+async fn agent_slot_delete(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<i64>,
+) -> Response {
+    if let Some(response) = page_guard(&state, &headers) {
+        return response;
+    }
+    if let Some(cancel) = state.agent_cancels.lock().unwrap().remove(&id) {
+        let _ = cancel.send(());
+    }
+    let db = state.db.lock().unwrap();
+    let slot_count: i64 = db
+        .query_row("SELECT COUNT(*) FROM agent_slots", [], |row| row.get(0))
+        .unwrap_or(0);
+    if slot_count > 1 {
+        let _ = db.execute("DELETE FROM agent_slots WHERE id = ?1", params![id]);
+    }
+    Redirect::to("/agents").into_response()
+}
+
+async fn agent_message_create(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Response {
+    if let Some(response) = page_guard(&state, &headers) {
+        return response;
+    }
+    let mut slot_id = None;
+    let mut body = String::new();
+    let mut upload = None;
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or("").to_string();
+        match name.as_str() {
+            "slot_id" => {
+                if let Ok(text) = field.text().await {
+                    slot_id = text.trim().parse::<i64>().ok();
+                }
+            }
+            "body" => {
+                if let Ok(text) = field.text().await {
+                    body = text;
+                }
+            }
+            "attachment" | "file" => {
+                let filename = field
+                    .file_name()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "attachment".into());
+                let content_type = field
+                    .content_type()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "application/octet-stream".into());
+                if let Ok(bytes) = field.bytes().await
+                    && !bytes.is_empty()
+                    && bytes.len() <= MAX_AGENT_UPLOAD_BYTES
+                {
+                    upload = Some(PendingUpload {
+                        filename,
+                        content_type,
+                        bytes: bytes.to_vec(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let slot_id = slot_id.unwrap_or(1);
+    let slot = {
+        let db = state.db.lock().unwrap();
+        get_agent_slot(&db, slot_id).unwrap_or(None)
+    };
+    let Some(slot) = slot else {
+        return Redirect::to("/agents").into_response();
+    };
+    let body = body.trim().to_string();
+    if body.len() > MAX_AGENT_MESSAGE_CHARS {
+        return Redirect::to(&agent_location(Some(slot.id))).into_response();
+    }
+    let attachment_id = if let Some(upload) = upload {
+        save_agent_upload(&state, &slot, upload).await.ok()
+    } else {
+        None
+    };
+    if body.is_empty() && attachment_id.is_none() {
+        return Redirect::to(&agent_location(Some(slot.id))).into_response();
+    }
+    {
+        let db = state.db.lock().unwrap();
+        let _ = append_agent_message(&db, slot.id, "user", &body, attachment_id);
+    }
+    if handle_agent_control(&state, &slot, &body) {
+        return Redirect::to(&agent_location(Some(slot.id))).into_response();
+    }
+    if state.agent_jobs.lock().unwrap().contains_key(&slot.id) {
+        let db = state.db.lock().unwrap();
+        let _ = append_agent_message(
+            &db,
+            slot.id,
+            "assistant",
+            &format!(
+                "{} is already running. Use another slot or send `!stop` first.",
+                slot.name
+            ),
+            None,
+        );
+        return Redirect::to(&agent_location(Some(slot.id))).into_response();
+    }
+    let request_body = if body.is_empty() {
+        "Please inspect the attached file.".to_string()
+    } else {
+        body
+    };
+    start_agent_job(state.clone(), slot.id, request_body, attachment_id);
+    Redirect::to(&agent_location(Some(slot.id))).into_response()
+}
+
+async fn agent_slot_state(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<i64>,
+) -> Response {
+    if let Some(response) = raw_guard(&state, &headers) {
+        return response;
+    }
+    let messages = {
+        let db = state.db.lock().unwrap();
+        list_agent_messages(&db, id).unwrap_or_default()
+    };
+    let run = agent_run_for(&state, id);
+    Json(AgentSlotPoll {
+        running: run.is_some(),
+        current: run.map(|run| run.current).unwrap_or_default(),
+        message_count: messages.len(),
+        messages_html: agent_messages_html(&messages),
+    })
+    .into_response()
+}
+
+async fn agent_attachment(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<i64>,
+) -> Response {
+    if let Some(response) = raw_guard(&state, &headers) {
+        return response;
+    }
+    let row = {
+        let db = state.db.lock().unwrap();
+        db.query_row(
+            "SELECT original_name, content_type, file_path, size_bytes FROM agent_attachments WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    PathBuf::from(row.get::<_, String>(2)?),
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .unwrap_or(None)
+    };
+    let Some((filename, content_type, path, size_bytes)) = row else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    if size_bytes < 0 || size_bytes as usize > MAX_AGENT_UPLOAD_BYTES {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "file too large").into_response();
+    }
+    let Ok(path) = path.canonicalize() else {
+        return (StatusCode::NOT_FOUND, "missing file").into_response();
+    };
+    let Ok(root) = state.config.agent_upload_dir.canonicalize() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "bad upload dir").into_response();
+    };
+    if !path.starts_with(root) || !path.is_file() {
+        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+    let Ok(bytes) = tokio::fs::read(&path).await else {
+        return (StatusCode::NOT_FOUND, "missing file").into_response();
+    };
+    let ascii_name = filename
+        .chars()
+        .filter(|ch| ch.is_ascii() && *ch != '"')
+        .collect::<String>();
+    let disposition = if content_type.starts_with("image/") {
+        format!(
+            "inline; filename=\"{}\"",
+            if ascii_name.is_empty() {
+                "attachment"
+            } else {
+                &ascii_name
+            }
+        )
+    } else {
+        format!(
+            "attachment; filename=\"{}\"",
+            if ascii_name.is_empty() {
+                "attachment"
+            } else {
+                &ascii_name
+            }
+        )
+    };
+    (
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_str(&content_type)
+                    .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+            ),
+            (
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_str(&disposition).unwrap(),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+fn agent_run_for(state: &AppState, slot_id: i64) -> Option<AgentRun> {
+    state.agent_jobs.lock().unwrap().get(&slot_id).cloned()
+}
+
+fn agent_slots_html(slots: &[AgentSlotRow], active_id: i64) -> String {
+    slots
+        .iter()
+        .map(|slot| {
+            let active_class = if slot.id == active_id { " active" } else { "" };
+            let slot_name = html_escape(&slot.name);
+            let delete = if slots.len() > 1 {
+                format!(
+                    r#"<form action="/agents/slots/{}/delete" method="post"><button class="icon danger-icon" type="submit" aria-label="Delete slot {}">x</button></form>"#,
+                    slot.id, slot_name
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                r##"<div class="channel-row{active_class}"><a class="channel-link" href="/agents?slot={}"><span>#</span>{}</a>{}</div>"##,
+                slot.id, slot_name, delete
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn agent_messages_html(messages: &[AgentMessageRow]) -> String {
+    if messages.is_empty() {
+        return r#"<p class="empty">No messages in this slot yet.</p>"#.into();
+    }
+    messages
+        .iter()
+        .rev()
+        .map(|message| {
+            let avatar = if message.role == "user" { "U" } else { "A" };
+            let body = if message.body.trim().is_empty() {
+                String::new()
+            } else {
+                format!(
+                    r#"<p>{}</p>"#,
+                    html_escape(&message.body).replace('\n', "<br>")
+                )
+            };
+            let attachment = message
+                .attachment
+                .as_ref()
+                .map(|attachment| {
+                    let name = html_escape(&attachment.name);
+                    if attachment.is_image {
+                        format!(
+                            r#"<a class="attachment-link" href="/agents/attachments/{}">{}</a><img class="message-image" src="/agents/attachments/{}" alt="">"#,
+                            attachment.id, name, attachment.id
+                        )
+                    } else {
+                        format!(
+                            r#"<a class="attachment-link" href="/agents/attachments/{}">{}</a>"#,
+                            attachment.id, name
+                        )
+                    }
+                })
+                .unwrap_or_default();
+            format!(
+                r#"<article class="message">
+  <div class="message-avatar">{avatar}</div>
+  <div class="message-body">
+    <div class="message-meta"><strong>{}</strong><span class="message-log">{}</span></div>
+    {}{}
+  </div>
+</article>"#,
+                html_escape(&message.role),
+                html_escape(&message.created_at),
+                body,
+                attachment
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn list_agent_slots(db: &Connection) -> rusqlite::Result<Vec<AgentSlotRow>> {
+    let mut stmt = db.prepare("SELECT id, name, workdir FROM agent_slots ORDER BY id ASC")?;
+    stmt.query_map([], |row| {
+        Ok(AgentSlotRow {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            workdir: row.get(2)?,
+        })
+    })?
+    .collect()
+}
+
+fn get_agent_slot(db: &Connection, id: i64) -> rusqlite::Result<Option<AgentSlotRow>> {
+    db.query_row(
+        "SELECT id, name, workdir FROM agent_slots WHERE id = ?1",
+        params![id],
+        |row| {
+            Ok(AgentSlotRow {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                workdir: row.get(2)?,
+            })
+        },
+    )
+    .optional()
+}
+
+fn ensure_agent_slot(db: &Connection, name: &str, workdir: &Path) -> rusqlite::Result<i64> {
+    let existing = db
+        .query_row(
+            "SELECT id FROM agent_slots WHERE name = ?1",
+            params![name],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+    db.execute(
+        "INSERT INTO agent_slots (name, workdir, created_at) VALUES (?1, ?2, ?3)",
+        params![name, workdir.to_string_lossy(), Utc::now().to_rfc3339()],
+    )?;
+    Ok(db.last_insert_rowid())
+}
+
+fn ensure_agent_slot_seeds(
+    db: &Connection,
+    seeds: &[AgentSlotSeed],
+    default_workdir: &Path,
+) -> rusqlite::Result<()> {
+    if seeds.is_empty() {
+        ensure_agent_slot(db, DEFAULT_AGENT_SLOT, default_workdir)?;
+        return Ok(());
+    }
+    for seed in seeds {
+        ensure_agent_slot(db, &seed.name, &seed.workdir)?;
+    }
+    Ok(())
+}
+
+fn list_agent_messages(db: &Connection, slot_id: i64) -> rusqlite::Result<Vec<AgentMessageRow>> {
+    let mut stmt = db.prepare(
+        "SELECT m.role, m.body, m.created_at, a.id, a.original_name, a.content_type, a.size_bytes
+         FROM agent_messages m
+         LEFT JOIN agent_attachments a ON a.id = m.attachment_id
+         WHERE m.slot_id = ?1
+         ORDER BY m.id DESC
+         LIMIT 200",
+    )?;
+    stmt.query_map(params![slot_id], |row| {
+        let attachment_id = row.get::<_, Option<i64>>(3)?;
+        let attachment = if let Some(id) = attachment_id {
+            let content_type = row.get::<_, String>(5)?;
+            Some(AgentAttachmentSummary {
+                id,
+                name: row.get(4)?,
+                is_image: content_type.starts_with("image/"),
+                content_type,
+                size_bytes: row.get(6)?,
+            })
+        } else {
+            None
+        };
+        Ok(AgentMessageRow {
+            role: row.get(0)?,
+            body: row.get(1)?,
+            created_at: row.get(2)?,
+            attachment,
+        })
+    })?
+    .collect()
+}
+
+fn append_agent_message(
+    db: &Connection,
+    slot_id: i64,
+    role: &str,
+    body: &str,
+    attachment_id: Option<i64>,
+) -> rusqlite::Result<i64> {
+    db.execute(
+        "INSERT INTO agent_messages (slot_id, role, body, attachment_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![slot_id, role, body, attachment_id, Utc::now().to_rfc3339()],
+    )?;
+    Ok(db.last_insert_rowid())
+}
+
+fn append_agent_assistant(state: &AppState, slot_id: i64, body: &str) {
+    let db = state.db.lock().unwrap();
+    let _ = append_agent_message(&db, slot_id, "assistant", body, None);
+}
+
+async fn save_agent_upload(
+    state: &AppState,
+    slot: &AgentSlotRow,
+    upload: PendingUpload,
+) -> io::Result<i64> {
+    let safe_name = sanitize_filename(&upload.filename);
+    let stored_name = format!("{}-{safe_name}", Uuid::new_v4().simple());
+    let slot_dir = state
+        .config
+        .agent_upload_dir
+        .join(format!("slot-{}", slot.id));
+    tokio::fs::create_dir_all(&slot_dir).await?;
+    let path = slot_dir.join(&stored_name);
+    tokio::fs::write(&path, &upload.bytes).await?;
+    let db = state.db.lock().unwrap();
+    db.execute(
+        "INSERT INTO agent_attachments (slot_id, original_name, stored_name, content_type, file_path, size_bytes, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            slot.id,
+            upload.filename,
+            stored_name,
+            upload.content_type,
+            path.to_string_lossy(),
+            upload.bytes.len() as i64,
+            Utc::now().to_rfc3339()
+        ],
+    )
+    .map_err(io_other)?;
+    Ok(db.last_insert_rowid())
+}
+
+fn handle_agent_control(state: &Arc<AppState>, slot: &AgentSlotRow, body: &str) -> bool {
+    let trimmed = body.trim();
+    let Some(text) = trimmed.strip_prefix('!').map(str::trim) else {
+        return false;
+    };
+    let lower = text.to_ascii_lowercase();
+    if matches!(lower.as_str(), "help" | "commands") {
+        append_agent_assistant(state, slot.id, &agent_help_text(state));
+        return true;
+    }
+    if matches!(lower.as_str(), "slots" | "list" | "overview") {
+        append_agent_assistant(state, slot.id, &agent_slots_status_text(state));
+        return true;
+    }
+    if lower == "pwd" {
+        append_agent_assistant(
+            state,
+            slot.id,
+            &format!("{} folder: `{}`", slot.name, slot.workdir),
+        );
+        return true;
+    }
+    if lower == "status" {
+        let run = agent_run_for(state, slot.id);
+        let status = run
+            .as_ref()
+            .map(|run| run.current.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(if run.is_some() { "running" } else { "idle" });
+        append_agent_assistant(
+            state,
+            slot.id,
+            &format!("{} is {status}. Folder: `{}`", slot.name, slot.workdir),
+        );
+        return true;
+    }
+    if lower == "model" || lower == "settings" {
+        append_agent_assistant(
+            state,
+            slot.id,
+            &format!(
+                "Agent command: `{}` `{}`",
+                state.config.agent_codex_bin,
+                state.config.agent_codex_args.join(" ")
+            ),
+        );
+        return true;
+    }
+    if matches!(lower.as_str(), "fresh" | "new" | "stayfresh") {
+        let keep_workdir = lower == "stayfresh";
+        let stopped = stop_agent_job(state, slot.id);
+        let workdir = if keep_workdir {
+            slot.workdir.clone()
+        } else {
+            state
+                .config
+                .agent_default_workdir
+                .to_string_lossy()
+                .to_string()
+        };
+        {
+            let db = state.db.lock().unwrap();
+            if !keep_workdir {
+                let _ = db.execute(
+                    "UPDATE agent_slots SET workdir = ?1 WHERE id = ?2",
+                    params![workdir, slot.id],
+                );
+            }
+            let _ = db.execute(
+                "DELETE FROM agent_sessions WHERE slot_id = ?1",
+                params![slot.id],
+            );
+            let _ = db.execute(
+                "DELETE FROM agent_messages WHERE slot_id = ?1",
+                params![slot.id],
+            );
+        }
+        let folder_text = if keep_workdir {
+            format!("Folder kept at `{workdir}`.")
+        } else {
+            format!("Folder reset to `{workdir}`.")
+        };
+        let stop_text = if stopped {
+            " Stopped the current job."
+        } else {
+            ""
+        };
+        append_agent_assistant(
+            state,
+            slot.id,
+            &format!(
+                "{} chat reset. {folder_text}{stop_text} Your next message starts a new agent chat.",
+                slot.name
+            ),
+        );
+        return true;
+    }
+    if lower == "stop" {
+        let stopped = stop_agent_job(state, slot.id);
+        append_agent_assistant(
+            state,
+            slot.id,
+            if stopped {
+                "Stop requested."
+            } else {
+                "This slot is not running."
+            },
+        );
+        return true;
+    }
+    if let Some(arg) = command_arg(text, "cd") {
+        let target = if arg.trim().is_empty() {
+            default_home_dir()
+        } else {
+            resolve_agent_path(arg, &slot.workdir)
+        };
+        if target.is_dir() {
+            let db = state.db.lock().unwrap();
+            let _ = db.execute(
+                "UPDATE agent_slots SET workdir = ?1 WHERE id = ?2",
+                params![target.to_string_lossy(), slot.id],
+            );
+            let _ = db.execute(
+                "DELETE FROM agent_sessions WHERE slot_id = ?1",
+                params![slot.id],
+            );
+            drop(db);
+            append_agent_assistant(
+                state,
+                slot.id,
+                &format!("{} folder set to `{}`", slot.name, target.display()),
+            );
+        } else {
+            append_agent_assistant(
+                state,
+                slot.id,
+                &format!("Folder does not exist: `{}`", target.display()),
+            );
+        }
+        return true;
+    }
+    if let Some(arg) = command_arg(text, "ls") {
+        append_agent_assistant(state, slot.id, &list_agent_path_text(slot, arg));
+        return true;
+    }
+    append_agent_assistant(
+        state,
+        slot.id,
+        &format!("Unknown Plugdeck agent command: `{text}`. Type `!help` for commands."),
+    );
+    true
+}
+
+fn stop_agent_job(state: &AppState, slot_id: i64) -> bool {
+    let cancel = state.agent_cancels.lock().unwrap().remove(&slot_id);
+    if let Some(cancel) = cancel {
+        let _ = cancel.send(());
+        true
+    } else {
+        false
+    }
+}
+
+fn agent_help_text(state: &AppState) -> String {
+    let slots = {
+        let db = state.db.lock().unwrap();
+        list_agent_slots(&db).unwrap_or_default()
+    };
+    let mut lines = vec!["Agent commands:".to_string()];
+    lines.extend(
+        [
+            "- `!help` or `!commands`",
+            "- `!slots`",
+            "- `!pwd`",
+            "- `!ls [path]`",
+            "- `!cd [path]`",
+            "- `!fresh`",
+            "- `!stayfresh`",
+            "- `!status`",
+            "- `!stop`",
+            "- `!model`",
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
+    lines.push(String::new());
+    lines.push("Slots:".into());
+    for slot in slots {
+        lines.push(format!("- `{}` at `{}`", slot.name, slot.workdir));
+    }
+    lines.join("\n")
+}
+
+fn agent_slots_status_text(state: &AppState) -> String {
+    let slots = {
+        let db = state.db.lock().unwrap();
+        list_agent_slots(&db).unwrap_or_default()
+    };
+    let jobs = state.agent_jobs.lock().unwrap();
+    let lines = slots
+        .iter()
+        .map(|slot| {
+            let state = if jobs.contains_key(&slot.id) {
+                "running"
+            } else {
+                "idle"
+            };
+            format!("{}: {state} | {}", slot.name, slot.workdir)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("Slots:\n```text\n{lines}\n```")
+}
+
+fn list_agent_path_text(slot: &AgentSlotRow, arg: &str) -> String {
+    let target = if arg.trim().is_empty() {
+        PathBuf::from(&slot.workdir)
+    } else {
+        resolve_agent_path(arg, &slot.workdir)
+    };
+    if !target.exists() {
+        return format!("Path does not exist: `{}`", target.display());
+    }
+    if target.is_file() {
+        return format!("{} file:\n```text\n{}\n```", slot.name, target.display());
+    }
+    if !target.is_dir() {
+        return format!("Path is not a directory: `{}`", target.display());
+    }
+    let mut rows = match fs::read_dir(&target) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') {
+                    return None;
+                }
+                let suffix = if path.is_dir() { "/" } else { "" };
+                Some((
+                    if path.is_dir() { 0 } else { 1 },
+                    name.to_lowercase(),
+                    format!("{name}{suffix}"),
+                ))
+            })
+            .collect::<Vec<_>>(),
+        Err(err) => return format!("Could not list `{}`: {err}", target.display()),
+    };
+    rows.sort();
+    let mut names = rows
+        .into_iter()
+        .take(120)
+        .map(|(_, _, name)| name)
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        names.push("(empty)".into());
+    }
+    format!(
+        "{} listing `{}`:\n```text\n{}\n```",
+        slot.name,
+        target.display(),
+        names.join("\n")
+    )
+}
+
+fn start_agent_job(
+    state: Arc<AppState>,
+    slot_id: i64,
+    request_body: String,
+    attachment_id: Option<i64>,
+) {
+    state.agent_jobs.lock().unwrap().insert(
+        slot_id,
+        AgentRun {
+            status: "starting".into(),
+            current: "starting".into(),
+            started_at: Utc::now().to_rfc3339(),
+        },
+    );
+    tokio::spawn(run_agent_job(state, slot_id, request_body, attachment_id));
+}
+
+async fn run_agent_job(
+    state: Arc<AppState>,
+    slot_id: i64,
+    request_body: String,
+    attachment_id: Option<i64>,
+) {
+    let slot = {
+        let db = state.db.lock().unwrap();
+        get_agent_slot(&db, slot_id).unwrap_or(None)
+    };
+    let Some(slot) = slot else {
+        state.agent_jobs.lock().unwrap().remove(&slot_id);
+        return;
+    };
+    append_agent_assistant(
+        &state,
+        slot_id,
+        &format!("{} started in `{}`.", slot.name, slot.workdir),
+    );
+    let attachment = attachment_id.and_then(|id| {
+        let db = state.db.lock().unwrap();
+        agent_attachment_for_prompt(&db, id).unwrap_or(None)
+    });
+    let prompt = build_agent_prompt(&slot, &request_body, attachment.as_ref());
+    let session = {
+        let db = state.db.lock().unwrap();
+        agent_session(&db, slot_id).unwrap_or(None)
+    };
+    let use_resume = session
+        .as_ref()
+        .is_some_and(|(_, workdir)| workdir == &slot.workdir);
+    let out_path = env::temp_dir().join(format!(
+        "plugdeck-agent-{}-{}.txt",
+        slot_id,
+        Uuid::new_v4().simple()
+    ));
+    let mut command = TokioCommand::new(&state.config.agent_codex_bin);
+    command.arg("exec");
+    if use_resume {
+        command.arg("resume").arg("--json");
+    } else {
+        command.arg("--json");
+    }
+    command.args(&state.config.agent_codex_args);
+    if use_resume {
+        if let Some((thread_id, _)) = session {
+            command
+                .arg("--output-last-message")
+                .arg(&out_path)
+                .arg(thread_id)
+                .arg(prompt);
+        }
+    } else {
+        command
+            .arg("--cd")
+            .arg(&slot.workdir)
+            .arg("--output-last-message")
+            .arg(&out_path)
+            .arg(prompt);
+    }
+    command
+        .current_dir(&slot.workdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            append_agent_assistant(
+                &state,
+                slot_id,
+                &format!("Could not start `{}`: {err}", state.config.agent_codex_bin),
+            );
+            state.agent_jobs.lock().unwrap().remove(&slot_id);
+            return;
+        }
+    };
+    let (cancel_tx, mut cancel_rx) = oneshot::channel();
+    state
+        .agent_cancels
+        .lock()
+        .unwrap()
+        .insert(slot_id, cancel_tx);
+    let stdout_task = child.stdout.take().map(|stdout| {
+        tokio::spawn(read_agent_stdout(
+            state.clone(),
+            slot_id,
+            slot.workdir.clone(),
+            stdout,
+        ))
+    });
+    let stderr_tail = Arc::new(Mutex::new(Vec::<String>::new()));
+    let stderr_task = child
+        .stderr
+        .take()
+        .map(|stderr| tokio::spawn(read_agent_stderr(stderr_tail.clone(), stderr)));
+    let started = Utc::now();
+    let stopped;
+    let status = tokio::select! {
+        result = child.wait() => {
+            stopped = false;
+            result
+        }
+        _ = &mut cancel_rx => {
+            stopped = true;
+            let _ = child.start_kill();
+            child.wait().await
+        }
+    };
+    if let Some(task) = stdout_task {
+        let _ = task.await;
+    }
+    if let Some(task) = stderr_task {
+        let _ = task.await;
+    }
+    state.agent_cancels.lock().unwrap().remove(&slot_id);
+    state.agent_jobs.lock().unwrap().remove(&slot_id);
+    let elapsed = (Utc::now() - started).num_seconds().max(0);
+    if stopped {
+        append_agent_assistant(
+            &state,
+            slot_id,
+            &format!("{} stopped after {elapsed}s.", slot.name),
+        );
+        let _ = tokio::fs::remove_file(&out_path).await;
+        return;
+    }
+    match status {
+        Ok(status) if status.success() => {
+            let final_text = tokio::fs::read_to_string(&out_path)
+                .await
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            append_agent_assistant(
+                &state,
+                slot_id,
+                &format!(
+                    "{} done in {elapsed}s.\n\n{}",
+                    slot.name,
+                    if final_text.is_empty() {
+                        "(Agent completed without a final message.)"
+                    } else {
+                        &final_text
+                    }
+                ),
+            );
+        }
+        Ok(status) => {
+            let tail = stderr_tail.lock().unwrap().join("\n");
+            append_agent_assistant(
+                &state,
+                slot_id,
+                &format!(
+                    "{} failed with exit code {} after {elapsed}s.\n\n```text\n{}\n```",
+                    slot.name,
+                    status.code().unwrap_or(-1),
+                    truncate_text(&tail, 2400)
+                ),
+            );
+        }
+        Err(err) => {
+            append_agent_assistant(
+                &state,
+                slot_id,
+                &format!("{} wait failed after {elapsed}s: {err}", slot.name),
+            );
+        }
+    }
+    let _ = tokio::fs::remove_file(&out_path).await;
+}
+
+async fn read_agent_stdout(
+    state: Arc<AppState>,
+    slot_id: i64,
+    workdir: String,
+    stdout: tokio::process::ChildStdout,
+) {
+    let mut lines = BufReader::new(stdout).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let event_type = event
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if event_type == "thread.started"
+            && let Some(thread_id) = event.get("thread_id").and_then(|value| value.as_str())
+        {
+            let db = state.db.lock().unwrap();
+            let _ = set_agent_session(&db, slot_id, thread_id, &workdir);
+            continue;
+        }
+        if !matches!(event_type, "item.started" | "item.completed") {
+            continue;
+        }
+        let item = event.get("item").unwrap_or(&serde_json::Value::Null);
+        if item.get("type").and_then(|value| value.as_str()) != Some("command_execution") {
+            continue;
+        }
+        let command = item
+            .get("command")
+            .and_then(|value| value.as_str())
+            .unwrap_or("(unknown command)");
+        if event_type == "item.started" {
+            state
+                .agent_jobs
+                .lock()
+                .unwrap()
+                .entry(slot_id)
+                .and_modify(|run| {
+                    run.status = "running".into();
+                    run.current = truncate_text(command, 160);
+                });
+            append_agent_assistant(
+                &state,
+                slot_id,
+                &format!("running: `{}`", truncate_text(command, 700)),
+            );
+        } else {
+            state
+                .agent_jobs
+                .lock()
+                .unwrap()
+                .entry(slot_id)
+                .and_modify(|run| {
+                    run.current.clear();
+                });
+            let exit_code = item.get("exit_code").and_then(|value| value.as_i64());
+            if exit_code.is_some_and(|code| code != 0) {
+                let output = item
+                    .get("aggregated_output")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                append_agent_assistant(
+                    &state,
+                    slot_id,
+                    &format!(
+                        "command exit {}: `{}`\n```text\n{}\n```",
+                        exit_code.unwrap_or(-1),
+                        truncate_text(command, 500),
+                        truncate_text(output, 1200)
+                    ),
+                );
+            }
+        }
+    }
+}
+
+async fn read_agent_stderr(tail: Arc<Mutex<Vec<String>>>, stderr: tokio::process::ChildStderr) {
+    let mut lines = BufReader::new(stderr).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut tail = tail.lock().unwrap();
+        tail.push(line.to_string());
+        if tail.len() > 80 {
+            let extra = tail.len() - 80;
+            tail.drain(0..extra);
+        }
+    }
+}
+
 async fn downloads_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Some(response) = page_guard(&state, &headers) {
         return response;
@@ -1020,9 +2293,9 @@ async fn download_file(
             .to_string_lossy()
             .into()
     });
-    let ascii_name = filename
+    let ascii_name = sanitize_filename(&filename)
         .chars()
-        .filter(|ch| ch.is_ascii() && *ch != '"')
+        .filter(|ch| ch.is_ascii() && !ch.is_ascii_control() && *ch != '"')
         .collect::<String>();
     let disposition = format!(
         "attachment; filename=\"{}\"",
@@ -1408,6 +2681,203 @@ fn note_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NoteRow> {
     })
 }
 
+#[derive(Debug, Clone)]
+struct AgentPromptAttachment {
+    filename: String,
+    content_type: String,
+    file_path: String,
+    size_bytes: i64,
+}
+
+fn agent_attachment_for_prompt(
+    db: &Connection,
+    id: i64,
+) -> rusqlite::Result<Option<AgentPromptAttachment>> {
+    db.query_row(
+        "SELECT original_name, content_type, file_path, size_bytes FROM agent_attachments WHERE id = ?1",
+        params![id],
+        |row| {
+            Ok(AgentPromptAttachment {
+                filename: row.get(0)?,
+                content_type: row.get(1)?,
+                file_path: row.get(2)?,
+                size_bytes: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+}
+
+fn agent_session(db: &Connection, slot_id: i64) -> rusqlite::Result<Option<(String, String)>> {
+    db.query_row(
+        "SELECT thread_id, workdir FROM agent_sessions WHERE slot_id = ?1",
+        params![slot_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+}
+
+fn set_agent_session(
+    db: &Connection,
+    slot_id: i64,
+    thread_id: &str,
+    workdir: &str,
+) -> rusqlite::Result<()> {
+    db.execute(
+        "INSERT INTO agent_sessions (slot_id, thread_id, workdir, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(slot_id) DO UPDATE SET
+           thread_id = excluded.thread_id,
+           workdir = excluded.workdir,
+           updated_at = excluded.updated_at",
+        params![slot_id, thread_id, workdir, Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+fn build_agent_prompt(
+    slot: &AgentSlotRow,
+    request_body: &str,
+    attachment: Option<&AgentPromptAttachment>,
+) -> String {
+    let mut prompt = format!(
+        "You are running from Plugdeck agent slot {}.\nCurrent working folder: {}\nKeep the final reply concise and include what changed plus any verification run.\n\nUser request:\n{}",
+        slot.name, slot.workdir, request_body
+    );
+    if let Some(attachment) = attachment {
+        prompt.push_str(&format!(
+            "\n\nAttached file:\n- name: {}\n- path: {}\n- type: {}\n- bytes: {}\nUse the file path directly if you need to inspect the upload.",
+            attachment.filename,
+            attachment.file_path,
+            attachment.content_type,
+            attachment.size_bytes
+        ));
+    }
+    prompt
+}
+
+fn agent_location(slot_id: Option<i64>) -> String {
+    slot_id
+        .filter(|id| *id > 0)
+        .map(|id| format!("/agents?slot={id}"))
+        .unwrap_or_else(|| "/agents".into())
+}
+
+fn command_arg<'a>(text: &'a str, command: &str) -> Option<&'a str> {
+    let trimmed = text.trim();
+    if trimmed.eq_ignore_ascii_case(command) {
+        return Some("");
+    }
+    if trimmed.len() > command.len()
+        && trimmed[..command.len()].eq_ignore_ascii_case(command)
+        && trimmed[command.len()..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+    {
+        return Some(trimmed[command.len()..].trim());
+    }
+    None
+}
+
+fn resolve_agent_path(raw: &str, base: &str) -> PathBuf {
+    let expanded = expand_local_path(raw.trim());
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        Path::new(base).join(expanded)
+    }
+}
+
+fn default_home_dir() -> PathBuf {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+fn expand_local_path(value: &str) -> PathBuf {
+    let trimmed = value.trim();
+    if trimmed == "~" {
+        return default_home_dir();
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        return default_home_dir().join(rest);
+    }
+    if let Some(rest) = trimmed.strip_prefix("$HOME/") {
+        return default_home_dir().join(rest);
+    }
+    PathBuf::from(trimmed)
+}
+
+fn split_env_args(value: &str) -> Vec<String> {
+    value
+        .split_whitespace()
+        .filter(|part| !part.trim().is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn parse_agent_slot_seeds(raw: Option<String>, default_workdir: &Path) -> Vec<AgentSlotSeed> {
+    let raw = raw.unwrap_or_else(|| DEFAULT_AGENT_SLOT.into());
+    raw.split(',')
+        .filter_map(|item| {
+            let item = item.trim();
+            if item.is_empty() {
+                return None;
+            }
+            let (name, workdir) = item
+                .split_once(':')
+                .map(|(name, workdir)| (name, expand_local_path(workdir)))
+                .unwrap_or_else(|| (item, default_workdir.to_path_buf()));
+            let name = normalize_agent_slot_name(name);
+            if name.is_empty() || name.chars().count() > MAX_AGENT_SLOT_CHARS {
+                None
+            } else {
+                Some(AgentSlotSeed { name, workdir })
+            }
+        })
+        .collect()
+}
+
+fn normalize_agent_slot_name(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn sanitize_filename(value: &str) -> String {
+    let sanitized = value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    if sanitized.is_empty() {
+        "attachment".into()
+    } else {
+        sanitized.chars().take(120).collect()
+    }
+}
+
+fn truncate_text(value: &str, max_chars: usize) -> String {
+    let value = value.trim();
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let keep = max_chars.saturating_sub(20);
+    value.chars().take(keep).collect::<String>() + "\n...[truncated]"
+}
+
 fn import_motehold(target: &Connection, source_path: &Path) -> io::Result<usize> {
     let source = Connection::open(source_path).map_err(io_other)?;
     let mut imported = 0usize;
@@ -1531,7 +3001,7 @@ fn page(title: &str, body: &str) -> Response {
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <title>{}</title>
 <style>
 {PAGE_CSS}
@@ -2049,6 +3519,11 @@ mod tests {
             bind: "127.0.0.1:0".into(),
             db_path: PathBuf::new(),
             download_dir: PathBuf::new(),
+            agent_default_workdir: PathBuf::new(),
+            agent_upload_dir: PathBuf::new(),
+            agent_codex_bin: "codex".into(),
+            agent_codex_args: Vec::new(),
+            agent_slots: Vec::new(),
             ytdlp: "yt-dlp".into(),
             js_runtime: None,
             max_active: 1,
