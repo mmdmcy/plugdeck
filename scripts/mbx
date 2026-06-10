@@ -1,0 +1,35 @@
+#!/usr/bin/env sh
+set -eu
+
+if [ -n "${PLUGDECK_ENV_FILE:-}" ] && [ -r "$PLUGDECK_ENV_FILE" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "" | "#"*) continue ;;
+      export\ *) line=${line#export } ;;
+    esac
+    key=${line%%=*}
+    value=${line#*=}
+    [ "$key" = "$line" ] && continue
+    case "$key" in
+      "" | *[!A-Za-z0-9_]*) continue ;;
+    esac
+    case "$value" in
+      \"*\") value=${value#\"}; value=${value%\"} ;;
+      \'*\') value=${value#\'}; value=${value%\'} ;;
+    esac
+    export "$key=$value"
+  done < "$PLUGDECK_ENV_FILE"
+fi
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
+
+if [ -x "$repo_dir/target/release/plugdeck" ]; then
+  exec "$repo_dir/target/release/plugdeck" mbx "$@"
+fi
+
+if command -v plugdeck >/dev/null 2>&1; then
+  exec plugdeck mbx "$@"
+fi
+
+exec cargo run --quiet --manifest-path "$repo_dir/Cargo.toml" -- mbx "$@"

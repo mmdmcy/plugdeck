@@ -187,6 +187,10 @@ async fn main() -> io::Result<()> {
             }
             Ok(())
         }
+        "mbx" => {
+            mbx_cmd(&args[1..])?;
+            Ok(())
+        }
         "import-motehold" => {
             let Some(path) = args.get(1) else {
                 eprintln!("usage: plugdeck import-motehold /path/to/messages.db");
@@ -200,7 +204,7 @@ async fn main() -> io::Result<()> {
         }
         _ => {
             eprintln!(
-                "usage: plugdeck [serve|hash-password --stdin|audit-public|import-motehold <db>]"
+                "usage: plugdeck [serve|hash-password --stdin|audit-public|mbx|import-motehold <db>]"
             );
             Ok(())
         }
@@ -945,6 +949,30 @@ struct AgentSlotRow {
     id: i64,
     name: String,
     workdir: String,
+}
+
+#[derive(Debug, Clone)]
+struct MbxSlot {
+    id: Option<i64>,
+    name: String,
+    workdir: String,
+    thread_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MbxAction {
+    Start,
+    New,
+    Resume,
+}
+
+struct MbxRunOptions {
+    workdir: Option<PathBuf>,
+    prompt: Vec<String>,
+    attach: bool,
+    restart: bool,
+    dry_run: bool,
+    unsafe_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2759,6 +2787,586 @@ fn set_agent_session(
     Ok(())
 }
 
+fn mbx_cmd(args: &[String]) -> io::Result<()> {
+    let command = args.first().map(String::as_str).unwrap_or("");
+    match command {
+        "" | "-h" | "--help" | "help" | "commands" => {
+            print!("{}", mbx_usage());
+            Ok(())
+        }
+        "slots" | "sessions" | "status" => mbx_status(args.get(1).map(String::as_str)),
+        "list" | "ls" => mbx_list_sessions(),
+        "stop" => {
+            let Some(slot) = args.get(1) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "usage: plugdeck mbx stop <slot|all>",
+                ));
+            };
+            mbx_stop(slot)
+        }
+        "start" | "s" | "new" | "n" | "resume" | "r" => {
+            let Some(slot_name) = args.get(1) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("usage: plugdeck mbx {command} <slot>"),
+                ));
+            };
+            let action = match command {
+                "new" | "n" => MbxAction::New,
+                "resume" | "r" => MbxAction::Resume,
+                _ => MbxAction::Start,
+            };
+            let options = mbx_parse_run_options(action, &args[2..])?;
+            mbx_run_slot(action, slot_name, options)
+        }
+        slot_name if !normalize_agent_slot_name(slot_name).is_empty() => {
+            let options = mbx_parse_run_options(MbxAction::Resume, &args[1..])?;
+            mbx_run_slot(MbxAction::Resume, slot_name, options)
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unknown mbx command; run `plugdeck mbx help`",
+        )),
+    }
+}
+
+fn mbx_usage() -> &'static str {
+    r#"Usage:
+  mbx r <slot> [prompt...]
+  mbx s <slot> [prompt...]
+  mbx n <slot> [prompt...]
+  mbx stop <slot|all>
+  mbx slots [slot]
+  mbx list
+
+Shortcuts:
+  mbx a          same as mbx r a
+  mbx r a        resume slot a's saved /agents thread when present
+  mbx s b        start Codex in slot b's /agents folder
+  mbx n c        restart slot c's tmux session fresh
+
+Options:
+  -C, --cd <dir>     Override the slot folder.
+  --unsafe           Add Codex's bypass approvals/sandbox flag.
+  --safe             Do not add the bypass flag.
+  --restart          Replace an existing tmux session.
+  --no-attach        Start or send without attaching.
+  --dry-run          Print what would run.
+"#
+}
+
+fn mbx_parse_run_options(action: MbxAction, args: &[String]) -> io::Result<MbxRunOptions> {
+    let mut options = MbxRunOptions {
+        workdir: None,
+        prompt: Vec::new(),
+        attach: true,
+        restart: action == MbxAction::New,
+        dry_run: false,
+        unsafe_mode: env_flag("PLUGDECK_MBX_UNSAFE", false),
+    };
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-h" | "--help" => {
+                print!("{}", mbx_usage());
+                std::process::exit(0);
+            }
+            "-C" | "--cd" | "--dir" => {
+                let Some(path) = args.get(index + 1) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("{} requires a directory", args[index]),
+                    ));
+                };
+                options.workdir = Some(expand_local_path(path));
+                index += 2;
+            }
+            "--safe" => {
+                options.unsafe_mode = false;
+                index += 1;
+            }
+            "--unsafe" => {
+                options.unsafe_mode = true;
+                index += 1;
+            }
+            "--restart" => {
+                options.restart = true;
+                index += 1;
+            }
+            "--no-attach" => {
+                options.attach = false;
+                index += 1;
+            }
+            "--dry-run" => {
+                options.dry_run = true;
+                index += 1;
+            }
+            "--" => {
+                options.prompt.extend(args[index + 1..].iter().cloned());
+                break;
+            }
+            value if value.starts_with('-') => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown mbx option: {value}"),
+                ));
+            }
+            value => {
+                let candidate = expand_local_path(value);
+                if options.workdir.is_none() && candidate.is_dir() {
+                    options.workdir = Some(candidate);
+                } else {
+                    options.prompt.push(value.to_string());
+                }
+                index += 1;
+            }
+        }
+    }
+    Ok(options)
+}
+
+fn mbx_run_slot(action: MbxAction, slot_name: &str, options: MbxRunOptions) -> io::Result<()> {
+    mbx_need_tmux()?;
+    let slot = mbx_find_slot(slot_name)?;
+    let workdir = mbx_resolve_workdir(options.workdir, &slot.workdir)?;
+    let session = mbx_session_name(&slot.name);
+    let codex_bin = env::var("PLUGDECK_AGENT_CODEX_BIN").unwrap_or_else(|_| "codex".into());
+    let codex_args = env::var("PLUGDECK_AGENT_CODEX_ARGS")
+        .ok()
+        .map(|value| split_env_args(&value))
+        .unwrap_or_default();
+    let codex_words = mbx_codex_words(
+        action,
+        &slot,
+        &workdir,
+        &options.prompt,
+        &codex_bin,
+        &codex_args,
+        options.unsafe_mode,
+    );
+    let cmdline = mbx_shell_join(&codex_words);
+    let resumes_saved = action == MbxAction::Resume && slot.thread_id.is_some();
+
+    if options.dry_run {
+        println!("slot:    {}", slot.name);
+        println!("session: {session}");
+        println!("workdir: {}", workdir.display());
+        println!("thread:  {}", if resumes_saved { "saved" } else { "fresh" });
+        println!("command: {cmdline}");
+        return Ok(());
+    }
+
+    if action == MbxAction::Resume && slot.thread_id.is_none() {
+        eprintln!(
+            "mbx: slot {} has no saved /agents thread yet; starting a fresh Codex session",
+            slot.name
+        );
+    }
+
+    if mbx_has_session(&session) {
+        if action == MbxAction::New || options.restart {
+            mbx_kill_session(&session)?;
+        } else {
+            if mbx_session_is_idle_shell(&session) {
+                mbx_send_keys(&session, &cmdline)?;
+            }
+            if options.attach {
+                return mbx_attach_session(&session);
+            }
+            println!("Sent to {} ({session})", slot.name);
+            return Ok(());
+        }
+    }
+
+    mbx_new_session(&session, &workdir)?;
+    mbx_send_keys(&session, &cmdline)?;
+    if options.attach {
+        mbx_attach_session(&session)?;
+    } else {
+        println!("Started {} ({session})", slot.name);
+    }
+    Ok(())
+}
+
+fn mbx_find_slot(raw_name: &str) -> io::Result<MbxSlot> {
+    let name = normalize_agent_slot_name(raw_name);
+    if name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid slot name: {raw_name}"),
+        ));
+    }
+    let slots = mbx_load_slots()?;
+    slots
+        .iter()
+        .find(|slot| slot.name.eq_ignore_ascii_case(&name))
+        .cloned()
+        .ok_or_else(|| {
+            let names = slots
+                .iter()
+                .map(|slot| slot.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("unknown /agents slot `{name}`; available: {names}"),
+            )
+        })
+}
+
+fn mbx_load_slots() -> io::Result<Vec<MbxSlot>> {
+    let db_path = mbx_db_path();
+    if !db_path.exists() {
+        return Ok(mbx_default_slots());
+    }
+    let db = Connection::open(&db_path).map_err(io_other)?;
+    let mut stmt = db
+        .prepare(
+            "SELECT s.id, s.name, s.workdir, sessions.thread_id
+             FROM agent_slots s
+             LEFT JOIN agent_sessions sessions ON sessions.slot_id = s.id
+             ORDER BY s.id ASC",
+        )
+        .map_err(io_other)?;
+    let slots = stmt
+        .query_map([], |row| {
+            Ok(MbxSlot {
+                id: Some(row.get(0)?),
+                name: row.get(1)?,
+                workdir: row.get(2)?,
+                thread_id: row.get(3)?,
+            })
+        })
+        .map_err(io_other)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(io_other)?;
+    if slots.is_empty() {
+        Ok(mbx_default_slots())
+    } else {
+        Ok(slots)
+    }
+}
+
+fn mbx_default_slots() -> Vec<MbxSlot> {
+    let default_workdir = env::var("PLUGDECK_AGENT_DEFAULT_WORKDIR")
+        .map(|value| expand_local_path(&value))
+        .unwrap_or_else(|_| default_home_dir());
+    let mut seeds = parse_agent_slot_seeds(env::var("PLUGDECK_AGENT_SLOTS").ok(), &default_workdir);
+    if seeds.is_empty() {
+        seeds = parse_agent_slot_seeds(None, &default_workdir);
+    }
+    seeds
+        .into_iter()
+        .map(|seed| MbxSlot {
+            id: None,
+            name: seed.name,
+            workdir: seed.workdir.to_string_lossy().into_owned(),
+            thread_id: None,
+        })
+        .collect()
+}
+
+fn mbx_db_path() -> PathBuf {
+    env::var("PLUGDECK_DB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("data/plugdeck.sqlite"))
+}
+
+fn mbx_resolve_workdir(override_path: Option<PathBuf>, slot_workdir: &str) -> io::Result<PathBuf> {
+    let path = override_path.unwrap_or_else(|| expand_local_path(slot_workdir));
+    if !path.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("slot folder does not exist: {}", path.display()),
+        ));
+    }
+    path.canonicalize()
+}
+
+fn mbx_codex_words(
+    action: MbxAction,
+    slot: &MbxSlot,
+    workdir: &Path,
+    prompt: &[String],
+    codex_bin: &str,
+    codex_args: &[String],
+    unsafe_mode: bool,
+) -> Vec<String> {
+    let mut words = vec![codex_bin.to_string()];
+    if unsafe_mode {
+        words.push("--dangerously-bypass-approvals-and-sandbox".into());
+    }
+    words.extend(codex_args.iter().cloned());
+    words.push("--cd".into());
+    words.push(workdir.to_string_lossy().into_owned());
+    if action == MbxAction::Resume
+        && let Some(thread_id) = &slot.thread_id
+    {
+        words.push("resume".into());
+        words.push(thread_id.clone());
+    }
+    if !prompt.is_empty() {
+        words.push(prompt.join(" "));
+    }
+    words
+}
+
+fn mbx_status(requested: Option<&str>) -> io::Result<()> {
+    let mut slots = mbx_load_slots()?;
+    if let Some(name) = requested {
+        let normalized = normalize_agent_slot_name(name);
+        slots.retain(|slot| slot.name.eq_ignore_ascii_case(&normalized));
+    }
+    if slots.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no matching /agents slots",
+        ));
+    }
+    println!(
+        "{:<6} {:<5} {:<10} {:<13} {:<14} path",
+        "slot", "id", "thread", "tmux", "session"
+    );
+    for slot in slots {
+        let session = mbx_session_name(&slot.name);
+        let tmux = mbx_tmux_state(&session).unwrap_or_else(|| "available".into());
+        println!(
+            "{:<6} {:<5} {:<10} {:<13} {:<14} {}",
+            slot.name,
+            slot.id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "-".into()),
+            if slot.thread_id.is_some() {
+                "saved"
+            } else {
+                "-"
+            },
+            tmux,
+            session,
+            slot.workdir
+        );
+    }
+    Ok(())
+}
+
+fn mbx_list_sessions() -> io::Result<()> {
+    mbx_need_tmux()?;
+    let prefix = mbx_session_prefix();
+    let output = StdCommand::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}|#{session_attached}"])
+        .output();
+    let Ok(output) = output else {
+        println!("No mbx sessions are running.");
+        return Ok(());
+    };
+    let lines = String::from_utf8_lossy(&output.stdout);
+    let mut found = false;
+    for line in lines.lines() {
+        let Some((session, attached)) = line.split_once('|') else {
+            continue;
+        };
+        if !session.starts_with(&format!("{prefix}-")) {
+            continue;
+        }
+        found = true;
+        let state = if attached == "1" {
+            "attached"
+        } else {
+            "detached"
+        };
+        println!("{session}\t{state}");
+    }
+    if !found {
+        println!("No mbx sessions are running.");
+    }
+    Ok(())
+}
+
+fn mbx_stop(slot_name: &str) -> io::Result<()> {
+    mbx_need_tmux()?;
+    if slot_name == "all" {
+        let prefix = mbx_session_prefix();
+        let output = StdCommand::new("tmux")
+            .args(["list-sessions", "-F", "#{session_name}"])
+            .output();
+        let Ok(output) = output else {
+            println!("No mbx sessions are running.");
+            return Ok(());
+        };
+        let mut found = false;
+        for session in String::from_utf8_lossy(&output.stdout).lines() {
+            if session.starts_with(&format!("{prefix}-")) {
+                mbx_kill_session(session)?;
+                println!("Stopped {session}");
+                found = true;
+            }
+        }
+        if !found {
+            println!("No mbx sessions are running.");
+        }
+        return Ok(());
+    }
+    let slot = mbx_find_slot(slot_name)?;
+    let session = mbx_session_name(&slot.name);
+    if mbx_has_session(&session) {
+        mbx_kill_session(&session)?;
+        println!("Stopped {} ({session})", slot.name);
+    } else {
+        println!("{} is not running.", slot.name);
+    }
+    Ok(())
+}
+
+fn mbx_need_tmux() -> io::Result<()> {
+    let status = StdCommand::new("tmux")
+        .arg("-V")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match status {
+        Ok(status) if status.success() => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "tmux is not installed or not on PATH",
+        )),
+    }
+}
+
+fn mbx_session_name(slot_name: &str) -> String {
+    format!("{}-{}", mbx_session_prefix(), slot_name)
+}
+
+fn mbx_session_prefix() -> String {
+    env::var("PLUGDECK_MBX_SESSION_PREFIX").unwrap_or_else(|_| "plugdeck".into())
+}
+
+fn mbx_has_session(session: &str) -> bool {
+    matches!(
+        StdCommand::new("tmux")
+            .args(["has-session", "-t", session])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status(),
+        Ok(status) if status.success()
+    )
+}
+
+fn mbx_new_session(session: &str, workdir: &Path) -> io::Result<()> {
+    let status = StdCommand::new("tmux")
+        .args(["new-session", "-d", "-s", session, "-n", session, "-c"])
+        .arg(workdir)
+        .status()?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "could not create tmux session {session}"
+        )));
+    }
+    let _ = StdCommand::new("tmux")
+        .args(["set-option", "-t", session, "remain-on-exit", "on"])
+        .status();
+    Ok(())
+}
+
+fn mbx_kill_session(session: &str) -> io::Result<()> {
+    let status = StdCommand::new("tmux")
+        .args(["kill-session", "-t", session])
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "could not stop tmux session {session}"
+        )))
+    }
+}
+
+fn mbx_send_keys(session: &str, cmdline: &str) -> io::Result<()> {
+    let status = StdCommand::new("tmux")
+        .args(["send-keys", "-t", session])
+        .arg(cmdline)
+        .arg("C-m")
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "could not send command to tmux session {session}"
+        )))
+    }
+}
+
+fn mbx_attach_session(session: &str) -> io::Result<()> {
+    let mut command = StdCommand::new("tmux");
+    if env::var_os("TMUX").is_some() {
+        command.args(["switch-client", "-t", session]);
+    } else {
+        command.args(["attach-session", "-t", session]);
+    }
+    let status = command.status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "could not attach tmux session {session}"
+        )))
+    }
+}
+
+fn mbx_session_is_idle_shell(session: &str) -> bool {
+    let Some(command) = mbx_pane_current_command(session) else {
+        return false;
+    };
+    matches!(command.as_str(), "bash" | "zsh" | "fish" | "sh")
+}
+
+fn mbx_tmux_state(session: &str) -> Option<String> {
+    if !mbx_has_session(session) {
+        return None;
+    }
+    let attached = mbx_tmux_format(session, "#{session_attached}")?;
+    Some(if attached.trim() == "1" {
+        "attached".into()
+    } else {
+        "detached".into()
+    })
+}
+
+fn mbx_pane_current_command(session: &str) -> Option<String> {
+    mbx_tmux_format(session, "#{pane_current_command}")
+}
+
+fn mbx_tmux_format(session: &str, format: &str) -> Option<String> {
+    let output = StdCommand::new("tmux")
+        .args(["display-message", "-p", "-t", session, format])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn mbx_shell_join(words: &[String]) -> String {
+    words
+        .iter()
+        .map(|word| mbx_shell_quote(word))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn mbx_shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(ch, '/' | '.' | '_' | '-' | ':' | '=' | ',' | '@' | '%')
+        })
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn build_agent_prompt(
     slot: &AgentSlotRow,
     request_body: &str,
@@ -3587,5 +4195,71 @@ mod tests {
         assert!(suspicious_secret_assignment(
             "PLUGDECK_COOKIE_SECRET=abc123"
         ));
+    }
+
+    #[test]
+    fn mbx_resume_uses_saved_agent_thread() {
+        let slot = MbxSlot {
+            id: Some(1),
+            name: "a".into(),
+            workdir: "/work".into(),
+            thread_id: Some("thread-123".into()),
+        };
+        let words = mbx_codex_words(
+            MbxAction::Resume,
+            &slot,
+            Path::new("/work"),
+            &["hello".into()],
+            "codex",
+            &["--search".into()],
+            false,
+        );
+        assert_eq!(
+            words,
+            vec![
+                "codex",
+                "--search",
+                "--cd",
+                "/work",
+                "resume",
+                "thread-123",
+                "hello"
+            ]
+        );
+    }
+
+    #[test]
+    fn mbx_resume_without_thread_starts_fresh() {
+        let slot = MbxSlot {
+            id: Some(1),
+            name: "a".into(),
+            workdir: "/work".into(),
+            thread_id: None,
+        };
+        let words = mbx_codex_words(
+            MbxAction::Resume,
+            &slot,
+            Path::new("/work"),
+            &[],
+            "codex",
+            &[],
+            true,
+        );
+        assert_eq!(
+            words,
+            vec![
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--cd",
+                "/work"
+            ]
+        );
+    }
+
+    #[test]
+    fn mbx_shell_quote_handles_spaces_and_quotes() {
+        assert_eq!(mbx_shell_quote("/tmp/repo"), "/tmp/repo");
+        assert_eq!(mbx_shell_quote("hello world"), "'hello world'");
+        assert_eq!(mbx_shell_quote("don't"), "'don'\\''t'");
     }
 }
