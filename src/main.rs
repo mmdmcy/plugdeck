@@ -38,7 +38,7 @@ use uuid::Uuid;
 mod modules;
 
 const DEFAULT_CHANNEL: &str = "general";
-const DEFAULT_AGENT_SLOT: &str = "a";
+const DEFAULT_AGENT_SLOTS: &str = "a,b,c,d,e";
 const MAX_NOTE_CHARS: usize = 256 * 1024;
 const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_AGENT_MESSAGE_CHARS: usize = 128 * 1024;
@@ -92,6 +92,9 @@ main{width:min(1180px,calc(100% - 32px));margin:0 auto;padding:18px 0}
 .channel-add summary{min-height:38px;display:flex;align-items:center;color:var(--accent2);font-weight:800;cursor:pointer;list-style:none}
 .channel-add summary::-webkit-details-marker{display:none}
 .channel-form{display:grid;gap:8px;margin-top:8px}
+.slot-add-form{display:grid;grid-template-columns:minmax(0,1fr) 42px;gap:7px;border-top:1px solid var(--line);padding-top:10px}
+.slot-add-form input{min-height:38px;padding:8px 10px}
+.slot-add-form button{min-height:38px;padding:0}
 .chat-pane{display:grid;grid-template-rows:auto minmax(0,1fr) auto;overflow:hidden}
 .chat-head{min-height:54px;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 16px;border-bottom:1px solid var(--line)}
 .chat-head strong{font-size:17px}
@@ -115,8 +118,8 @@ main{width:min(1180px,calc(100% - 32px));margin:0 auto;padding:18px 0}
 .agent-pane{grid-template-rows:auto minmax(0,1fr) auto}
 .agent-status{color:var(--muted);font-weight:700;font-size:13px;white-space:nowrap}
 .agent-compose-wrap{border-top:1px solid var(--line);background:var(--panel)}
-.agent-quick{display:flex;gap:7px;overflow-x:auto;padding:10px 12px 0;scrollbar-width:thin}
-.agent-quick button{flex:0 0 auto;min-width:max-content;min-height:36px;padding:0 11px;white-space:nowrap}
+.agent-quick{display:flex;gap:6px;overflow-x:auto;padding:8px 12px 0;scrollbar-width:thin}
+.agent-quick button{flex:0 0 auto;min-width:max-content;min-height:34px;padding:0 10px;white-space:nowrap;font-size:14px}
 .agent-composer{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:8px;padding:10px 12px 12px;min-width:0}
 .agent-composer textarea{min-height:52px;max-height:30dvh;resize:vertical}
 .attachment-link{display:inline-flex;align-items:center;min-height:34px;border:1px solid var(--line);border-radius:6px;padding:0 9px;margin-top:8px;color:var(--accent2);font-weight:800;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -132,26 +135,35 @@ main{width:min(1180px,calc(100% - 32px));margin:0 auto;padding:18px 0}
 #fill{height:100%;width:6%;background:var(--accent)}
 pre{white-space:pre-wrap;word-break:break-word;color:var(--muted);max-height:44vh;overflow:auto;border-top:1px solid var(--line);padding-top:12px}
 @media(max-width:760px){
-  nav,.hero{padding:0 14px}
+  body{font-size:14px}
+  nav,.hero{height:52px;padding:0 12px}
+  h1{font-size:22px}
   main{width:calc(100% - 20px)}
-  .chat-shell{width:100%;height:calc(100svh - 64px);padding:0;gap:0;grid-template-columns:1fr;grid-template-rows:auto minmax(0,1fr)}
-  .channel-rail{border-width:0 0 1px;border-radius:0;padding:10px;display:grid;grid-template-rows:auto auto auto;gap:8px;max-height:34svh}
-  .channel-list{display:flex;gap:8px;overflow-x:auto;overflow-y:hidden;padding-bottom:2px}
+  .chat-shell{width:100%;height:calc(100dvh - 52px);padding:0;gap:0;grid-template-columns:1fr;grid-template-rows:auto minmax(0,1fr)}
+  .channel-rail{border-width:0 0 1px;border-radius:0;padding:8px;display:grid;grid-template-rows:auto auto;gap:7px;max-height:128px}
+  .agent-shell .rail-title{display:none}
+  .channel-list{display:flex;gap:6px;overflow-x:auto;overflow-y:hidden;padding-bottom:1px}
   .channel-row{display:flex;flex:0 0 auto}
-  .channel-link{white-space:nowrap}
+  .channel-link{white-space:nowrap;min-height:34px;padding:0 9px;font-size:14px}
   .channel-row .icon{display:none}
-  .channel-add{padding-top:8px}
+  .slot-add-form{padding-top:0;border-top:0;grid-template-columns:minmax(0,1fr) 38px}
+  .slot-add-form input{min-height:36px;padding:7px 9px}
+  .slot-add-form button{min-height:36px}
+  .channel-add{padding-top:6px}
   .chat-pane{border:0;border-radius:0}
-  .chat-head{min-height:48px;padding:0 12px}
-  .message-list{padding:10px 12px}
+  .chat-head{min-height:42px;padding:0 10px}
+  .chat-head strong{font-size:15px}
+  .chat-head span{font-size:12px}
+  .message-list{padding:8px 10px}
   .message{grid-template-columns:32px minmax(0,1fr);gap:8px}
   .message-avatar{width:32px;height:32px}
   .composer{grid-template-columns:minmax(0,1fr) 88px;padding:10px}
   .composer textarea{grid-column:1/-1;min-height:56px}
-  .agent-shell{height:calc(100dvh - 64px)}
-  .agent-quick{padding:8px 10px 0}
-  .agent-composer{grid-template-columns:minmax(0,1fr) 86px;padding:8px 10px max(10px,env(safe-area-inset-bottom))}
-  .agent-composer textarea{grid-column:1/-1;min-height:54px;max-height:26dvh}
+  .agent-shell{height:calc(100dvh - 52px)}
+  .agent-quick{padding:7px 8px 0;gap:5px}
+  .agent-quick button{min-height:31px;padding:0 8px;font-size:13px}
+  .agent-composer{grid-template-columns:minmax(0,1fr) 74px;padding:7px 8px max(8px,env(safe-area-inset-bottom));gap:7px}
+  .agent-composer textarea{grid-column:1/-1;min-height:50px;max-height:22dvh;padding:8px 10px}
   .agent-composer .file-pill{min-width:0}
   .file-pill{min-width:0}
 }
@@ -1004,26 +1016,22 @@ async fn agents_page(
   <aside class="channel-rail" aria-label="Slots">
     <div class="rail-title">Slots</div>
     <div class="channel-list">{slots_html}</div>
-    <details class="channel-add">
-      <summary>Add slot</summary>
-      <form action="/agents/slots" method="post" class="channel-form">
-        <input name="name" maxlength="{MAX_AGENT_SLOT_CHARS}" placeholder="a" required>
-        <input name="workdir" placeholder="Folder">
-        <button type="submit">Add</button>
-      </form>
-    </details>
+    <form action="/agents/slots" method="post" class="slot-add-form">
+      <input name="name" maxlength="{MAX_AGENT_SLOT_CHARS}" placeholder="new slot" aria-label="New slot name" required>
+      <button type="submit" aria-label="Add slot">+</button>
+    </form>
   </aside>
   <section class="chat-pane agent-pane">
     <header class="chat-head"><strong># {active_slot_name}</strong><span data-agent-count>{message_count} messages</span><span class="agent-status" data-agent-status>{}</span></header>
     <div class="message-list" data-agent-messages>{messages_html}</div>
     <section class="agent-compose-wrap">
       <div class="agent-quick">
-        <button type="button" data-agent-cmd="!status">status</button>
+        <button type="button" data-agent-cmd="!status">stat</button>
         <button type="button" data-agent-cmd="!pwd">pwd</button>
         <button type="button" data-agent-cmd="!ls">ls</button>
         <button type="button" data-agent-cmd="!slots">slots</button>
         <button type="button" data-agent-cmd="!fresh">fresh</button>
-        <button type="button" data-agent-cmd="!stayfresh">stayfresh</button>
+        <button type="button" data-agent-cmd="!stayfresh" aria-label="stayfresh" title="stayfresh">stay</button>
         <button type="button" data-agent-cmd="!stop">stop</button>
       </div>
       <form action="/agents" method="post" enctype="multipart/form-data" class="agent-composer">
@@ -1464,7 +1472,9 @@ fn ensure_agent_slot_seeds(
     default_workdir: &Path,
 ) -> rusqlite::Result<()> {
     if seeds.is_empty() {
-        ensure_agent_slot(db, DEFAULT_AGENT_SLOT, default_workdir)?;
+        for name in DEFAULT_AGENT_SLOTS.split(',') {
+            ensure_agent_slot(db, name, default_workdir)?;
+        }
         return Ok(());
     }
     for seed in seeds {
@@ -2818,7 +2828,7 @@ fn split_env_args(value: &str) -> Vec<String> {
 }
 
 fn parse_agent_slot_seeds(raw: Option<String>, default_workdir: &Path) -> Vec<AgentSlotSeed> {
-    let raw = raw.unwrap_or_else(|| DEFAULT_AGENT_SLOT.into());
+    let raw = raw.unwrap_or_else(|| DEFAULT_AGENT_SLOTS.into());
     raw.split(',')
         .filter_map(|item| {
             let item = item.trim();
