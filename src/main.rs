@@ -92,7 +92,9 @@ main{width:min(1180px,calc(100% - 32px));margin:0 auto;padding:18px 0}
 .channel-add summary{min-height:38px;display:flex;align-items:center;color:var(--accent2);font-weight:800;cursor:pointer;list-style:none}
 .channel-add summary::-webkit-details-marker{display:none}
 .channel-form{display:grid;gap:8px;margin-top:8px}
+.slot-add-toggle{width:38px;min-height:38px;padding:0;flex:0 0 auto}
 .slot-add-form{display:grid;grid-template-columns:minmax(0,1fr) 42px;gap:7px;border-top:1px solid var(--line);padding-top:10px}
+.slot-add-form[hidden]{display:none}
 .slot-add-form input{min-height:38px;padding:8px 10px}
 .slot-add-form button{min-height:38px;padding:0}
 .chat-pane{display:grid;grid-template-rows:auto minmax(0,1fr) auto;overflow:hidden}
@@ -146,6 +148,7 @@ pre{white-space:pre-wrap;word-break:break-word;color:var(--muted);max-height:44v
   .channel-row{display:flex;flex:0 0 auto}
   .channel-link{white-space:nowrap;min-height:34px;padding:0 9px;font-size:14px}
   .channel-row .icon{display:none}
+  .slot-add-toggle{width:34px;min-height:34px}
   .slot-add-form{padding-top:0;border-top:0;grid-template-columns:minmax(0,1fr) 38px}
   .slot-add-form input{min-height:36px;padding:7px 9px}
   .slot-add-form button{min-height:36px}
@@ -1015,9 +1018,9 @@ async fn agents_page(
 <main class="chat-shell agent-shell">
   <aside class="channel-rail" aria-label="Slots">
     <div class="rail-title">Slots</div>
-    <div class="channel-list">{slots_html}</div>
-    <form action="/agents/slots" method="post" class="slot-add-form">
-      <input name="name" maxlength="{MAX_AGENT_SLOT_CHARS}" placeholder="new slot" aria-label="New slot name" required>
+    <div class="channel-list">{slots_html}<button type="button" class="ghost slot-add-toggle" data-slot-add-toggle aria-label="Add slot" aria-expanded="false" aria-controls="slotAddPanel">+</button></div>
+    <form action="/agents/slots" method="post" class="slot-add-form" id="slotAddPanel" hidden>
+      <input name="name" maxlength="{MAX_AGENT_SLOT_CHARS}" placeholder="new slot" aria-label="New slot name" data-slot-add-input required>
       <button type="submit" aria-label="Add slot">+</button>
     </form>
   </aside>
@@ -1049,6 +1052,17 @@ async fn agents_page(
   const status = document.querySelector("[data-agent-status]");
   const count = document.querySelector("[data-agent-count]");
   const input = document.getElementById("agentBody");
+  const addToggle = document.querySelector("[data-slot-add-toggle]");
+  const addPanel = document.getElementById("slotAddPanel");
+  const addInput = document.querySelector("[data-slot-add-input]");
+  if (addToggle && addPanel) {{
+    addToggle.addEventListener("click", () => {{
+      const open = addPanel.hasAttribute("hidden");
+      addPanel.toggleAttribute("hidden", !open);
+      addToggle.setAttribute("aria-expanded", String(open));
+      if (open && addInput) setTimeout(() => addInput.focus(), 0);
+    }});
+  }}
   document.querySelectorAll("[data-agent-cmd]").forEach((button) => {{
     button.addEventListener("click", () => {{
       input.value = button.dataset.agentCmd || "";
