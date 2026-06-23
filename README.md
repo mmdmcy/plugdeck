@@ -1,22 +1,17 @@
 # Plugdeck
 
-Plugdeck is a private-first Rust web app for small self-hosted tools. It is
-meant to be the one place where you build and use lightweight modules instead
-of scattering each tiny tool across a separate repository, service, and port.
+Plugdeck is retired. The former modules now live as focused services:
 
-It is not a replacement for large apps such as Git forges, password managers,
-or media servers. Those should stay as separate services and can be linked from
-Plugdeck.
+- Motehold for notes.
+- Mobailmux for agent lanes and `mbx`.
+- YTDLP Web for the yt-dlp queue.
 
-Current modules:
+This repository remains available for history and migration reference. New
+deployments should use the split services instead of adding more modules here.
 
-- Notes with channels, messages, and optional image attachments.
-- Agents with saved Codex conversation browsing, usage status, resets, and file/photo uploads.
-- YTP Downloader for YouTube downloads through `yt-dlp`.
-- Links to larger external services.
-
-Plugdeck is not a public internet gateway. Keep it private, use an app password,
-and do not commit local config, databases, downloads, or logs.
+Plugdeck is not a public internet gateway. If you keep an old instance running
+during migration, keep it private, use an app password, and do not commit local
+config, databases, downloads, or logs.
 
 ## Run
 
@@ -35,7 +30,7 @@ PLUGDECK_AGENT_DEFAULT_WORKDIR=~
 PLUGDECK_AGENT_UPLOAD_DIR=data/agent-uploads
 PLUGDECK_AGENT_SLOTS=codex
 PLUGDECK_AGENT_CODEX_BIN=codex
-PLUGDECK_AGENT_CODEX_ARGS=
+PLUGDECK_AGENT_CODEX_ARGS=--dangerously-bypass-approvals-and-sandbox
 PLUGDECK_LINKS_FILE=plugdeck.local.toml
 PLUGDECK_PASSWORD_HASH='$argon2id$...'
 PLUGDECK_COOKIE_SECRET=<random hex>

@@ -98,6 +98,11 @@ fn agents_routes(router: AppRouter) -> AppRouter {
             "/agents/slots/{id}/conversation",
             post(crate::agent_conversation_load),
         )
+        .route(
+            "/agents/slots/{id}/project",
+            post(crate::agent_project_start),
+        )
+        .route("/agents/slots/{id}/cancel", post(crate::agent_cancel))
         .route("/agents/slots/{id}/state", get(crate::agent_slot_state))
         .route("/agents/attachments/{id}", get(crate::agent_attachment))
         .route("/agents/codex/reset", post(crate::codex_reset_post))
