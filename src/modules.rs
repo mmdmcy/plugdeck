@@ -94,10 +94,13 @@ fn agents_routes(router: AppRouter) -> AppRouter {
             "/agents",
             get(crate::agents_page).post(crate::agent_message_create),
         )
-        .route("/agents/slots", post(crate::agent_slot_create))
-        .route("/agents/slots/{id}/delete", post(crate::agent_slot_delete))
+        .route(
+            "/agents/slots/{id}/conversation",
+            post(crate::agent_conversation_load),
+        )
         .route("/agents/slots/{id}/state", get(crate::agent_slot_state))
         .route("/agents/attachments/{id}", get(crate::agent_attachment))
+        .route("/agents/codex/reset", post(crate::codex_reset_post))
 }
 
 fn downloads_routes(router: AppRouter) -> AppRouter {
@@ -126,18 +129,17 @@ fn notes_detail(state: &AppState) -> String {
 }
 
 fn agents_detail(state: &AppState) -> String {
-    let (slots, messages) = {
+    let messages = {
         let db = state.db.lock().unwrap();
-        let slots: i64 = db
-            .query_row("SELECT COUNT(*) FROM agent_slots", [], |row| row.get(0))
-            .unwrap_or(0);
-        let messages: i64 = db
-            .query_row("SELECT COUNT(*) FROM agent_messages", [], |row| row.get(0))
-            .unwrap_or(0);
-        (slots, messages)
+        db.query_row("SELECT COUNT(*) FROM agent_messages", [], |row| row.get(0))
+            .unwrap_or(0)
     };
     let running = state.agent_jobs.lock().unwrap().len();
-    format!("{slots} slots · {messages} messages · {running} running")
+    if running == 0 {
+        format!("{messages} messages")
+    } else {
+        format!("{messages} messages · {running} running")
+    }
 }
 
 fn downloads_detail(state: &AppState) -> String {

@@ -11,7 +11,7 @@ Plugdeck.
 Current modules:
 
 - Notes with channels, messages, and optional image attachments.
-- Agents with addable Codex slots, command shortcuts, and file/photo uploads.
+- Agents with saved Codex conversation browsing, usage status, resets, and file/photo uploads.
 - YTP Downloader for YouTube downloads through `yt-dlp`.
 - Links to larger external services.
 
@@ -33,11 +33,9 @@ PLUGDECK_DB=data/plugdeck.sqlite
 PLUGDECK_DOWNLOAD_DIR=data/downloads
 PLUGDECK_AGENT_DEFAULT_WORKDIR=~
 PLUGDECK_AGENT_UPLOAD_DIR=data/agent-uploads
-PLUGDECK_AGENT_SLOTS=a,b,c,d,e
+PLUGDECK_AGENT_SLOTS=codex
 PLUGDECK_AGENT_CODEX_BIN=codex
 PLUGDECK_AGENT_CODEX_ARGS=
-PLUGDECK_MBX_UNSAFE=0
-PLUGDECK_MBX_SESSION_PREFIX=plugdeck
 PLUGDECK_LINKS_FILE=plugdeck.local.toml
 PLUGDECK_PASSWORD_HASH='$argon2id$...'
 PLUGDECK_COOKIE_SECRET=<random hex>
@@ -72,27 +70,6 @@ and the home menu. Add new module wiring in `src/modules.rs`:
 The existing Notes, Agents, and YTP Downloader modules are the reference
 patterns for forms, uploads, background jobs, and home menu stats.
 
-## Agent Tmux Shortcuts
-
-Plugdeck includes an `mbx` compatibility wrapper for the Agents module:
-
-```sh
-scripts/mbx r a
-scripts/mbx slots
-scripts/mbx stop a
-```
-
-`mbx r <slot>` reads the same `agent_slots` and `agent_sessions` rows used by
-`/agents`. If the slot has a saved Codex thread id, it opens `codex resume` for
-that thread inside a tmux session named `plugdeck-<slot>`; otherwise it starts a
-fresh Codex session in the slot folder.
-
-## Import Motehold
-
-```sh
-cargo run -- import-motehold /path/to/messages.db
-```
-
 ## Publishing Safely
 
 Before pushing public changes:
@@ -102,6 +79,12 @@ cargo fmt --check
 cargo test
 cargo run -- audit-public
 ```
+
+For production use, build a release binary and run the service from a versioned
+artifact path such as `/var/lib/plugroot/releases/plugdeck/current/plugdeck`
+instead of directly from `target/release` inside the Git checkout. Keep the
+checkout as source, and let Plugroot's `release-check`/`doctor --strict` catch
+dirty trees before restarts.
 
 For local protection, install the Git hooks:
 

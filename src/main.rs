@@ -16,14 +16,16 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    cmp::Reverse,
     collections::HashMap,
     env, fs,
-    io::{self, Read},
+    io::{self, BufRead, Read, Write},
     net::SocketAddr,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command as StdCommand, Stdio},
     sync::{Arc, Mutex},
+    time::{Duration as StdDuration, Instant, SystemTime},
 };
 use subtle::ConstantTimeEq;
 use tokio::{
@@ -35,142 +37,30 @@ use tokio_util::io::ReaderStream;
 use url::Url;
 use uuid::Uuid;
 
+mod codex_reset_ledger;
+mod db_migrations;
 mod modules;
 
 const DEFAULT_CHANNEL: &str = "general";
-const DEFAULT_AGENT_SLOTS: &str = "a,b,c,d,e";
+const DEFAULT_AGENT_SLOTS: &str = "codex";
 const MAX_NOTE_CHARS: usize = 256 * 1024;
 const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_AGENT_MESSAGE_CHARS: usize = 128 * 1024;
 const MAX_AGENT_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
 const MAX_CHANNEL_CHARS: usize = 40;
 const MAX_AGENT_SLOT_CHARS: usize = 32;
+const MAX_CODEX_CONVERSATIONS: usize = 120;
+const MAX_CODEX_TRANSCRIPT_MESSAGES: usize = 80;
+const CODEX_SESSION_SCAN_LIMIT: usize = 180;
+const CODEX_PROJECT_DRAWER_LIMIT: usize = 48;
+const CODEX_PROJECT_VISIBLE_CONVERSATIONS: usize = 3;
+const CODEX_PROJECT_CONVERSATION_LIMIT: usize = 24;
+const CODEX_INDEX_REFRESH_AFTER: StdDuration = StdDuration::from_secs(30);
+const CODEX_APP_SERVER_TIMEOUT: StdDuration = StdDuration::from_secs(12);
+const CODEX_APP_SERVER_WRITE_SETTLE: StdDuration = StdDuration::from_secs(5);
 const SESSION_COOKIE: &str = "plugdeck_session";
 const SESSION_DAYS: i64 = 30;
-const PAGE_CSS: &str = r#"
-:root{color-scheme:light dark;--bg:#f6f7f5;--fg:#161816;--muted:#68706a;--line:#d7dcd5;--panel:#fff;--accent:#0d6b57;--accent-soft:#e3f1ec;--accent2:#315f9f;--danger:#ad2f28}
-@media(prefers-color-scheme:dark){:root{--bg:#101211;--fg:#f4f5ef;--muted:#a2aaa4;--line:#323934;--panel:#171b18;--accent:#55b59c;--accent-soft:#19362f;--accent2:#8fb5f2;--danger:#ff8a7d}}
-*{box-sizing:border-box}
-html,body{min-height:100%}
-body{margin:0;background:var(--bg);color:var(--fg);font:15px system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:0}
-a{color:inherit;text-decoration:none}
-button,input,select,textarea{font:inherit;font-size:16px}
-button,.button{min-height:42px;border:0;border-radius:7px;background:var(--accent);color:#fff;padding:0 15px;font-weight:700;cursor:pointer}
-.ghost,.icon{background:transparent;color:var(--fg);border:1px solid var(--line)}
-.icon{width:34px;min-height:34px;padding:0}
-.danger-icon{color:var(--danger)}
-input,select,textarea{width:100%;border:1px solid var(--line);border-radius:7px;background:transparent;color:var(--fg);padding:11px}
-textarea{min-height:110px;resize:vertical}
-nav,.hero{height:64px;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:0 20px;border-bottom:1px solid var(--line)}
-nav a{color:var(--accent2);font-weight:700}
-h1{font-size:28px;line-height:1.1;margin:0}
-main{width:min(1180px,calc(100% - 32px));margin:0 auto;padding:18px 0}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}
-.tile,.download section{border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:14px}
-.tile{min-height:96px;display:flex;flex-direction:column;justify-content:space-between}
-.tile.primary{border-color:var(--accent)}
-.tile strong{font-size:18px}
-.tile span,.muted{color:var(--muted)}
-.split{display:grid;grid-template-columns:minmax(210px,280px) minmax(0,1fr);gap:14px}
-.stack{display:grid;gap:10px}
-.list{display:grid;gap:8px;margin-top:14px}
-.row,.note-head{display:flex;align-items:center;justify-content:space-between;gap:10px}
-.notes{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-top:14px}
-.note p{white-space:normal;word-break:break-word;line-height:1.45}
-.note img{max-width:100%;border-radius:6px;border:1px solid var(--line)}
-.chat-shell{width:min(1180px,calc(100% - 32px));height:calc(100svh - 64px);padding:12px 0;display:grid;grid-template-columns:240px minmax(0,1fr);gap:12px;min-width:0}
-.channel-rail,.chat-pane{min-width:0;min-height:0;border:1px solid var(--line);background:var(--panel);border-radius:8px}
-.channel-rail{padding:12px;display:flex;flex-direction:column;gap:10px;overflow:hidden}
-.rail-title{font-size:12px;font-weight:800;color:var(--muted);text-transform:uppercase}
-.channel-list{display:grid;gap:6px;overflow:auto}
-.channel-row{display:grid;grid-template-columns:minmax(0,1fr) 34px;gap:6px;align-items:center}
-.channel-link{min-height:38px;display:flex;align-items:center;gap:6px;min-width:0;border-radius:6px;padding:0 10px;color:var(--muted);font-weight:700;overflow:hidden;text-overflow:ellipsis}
-.channel-link span{color:var(--muted)}
-.channel-row.active .channel-link{background:var(--accent-soft);color:var(--fg)}
-.channel-row .icon{opacity:.75}
-.channel-add{border-top:1px solid var(--line);padding-top:10px}
-.channel-add summary{min-height:38px;display:flex;align-items:center;color:var(--accent2);font-weight:800;cursor:pointer;list-style:none}
-.channel-add summary::-webkit-details-marker{display:none}
-.channel-form{display:grid;gap:8px;margin-top:8px}
-.slot-add-toggle{width:38px;min-height:38px;padding:0;flex:0 0 auto}
-.slot-add-form{display:grid;grid-template-columns:minmax(0,1fr) 42px;gap:7px;border-top:1px solid var(--line);padding-top:10px}
-.slot-add-form[hidden]{display:none}
-.slot-add-form input{min-height:38px;padding:8px 10px}
-.slot-add-form button{min-height:38px;padding:0}
-.chat-pane{display:grid;grid-template-rows:auto minmax(0,1fr) auto;overflow:hidden}
-.chat-head{min-height:54px;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 16px;border-bottom:1px solid var(--line)}
-.chat-head strong{font-size:17px}
-.chat-head span{color:var(--muted)}
-.message-list{min-height:0;overflow:auto;padding:16px;display:grid;align-content:end;gap:2px}
-.message{display:grid;grid-template-columns:38px minmax(0,1fr);gap:10px;padding:8px 0}
-.message-avatar{width:38px;height:38px;border-radius:50%;display:grid;place-items:center;background:var(--accent-soft);color:var(--accent);font-weight:900}
-.message-body{min-width:0}
-.message-meta{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:34px}
-.message-meta form{opacity:0}
-.message:hover .message-meta form,.message:focus-within .message-meta form{opacity:1}
-.message p{margin:4px 0 0;white-space:normal;word-break:break-word;line-height:1.45}
-.message-image{display:block;max-width:min(420px,100%);border-radius:6px;border:1px solid var(--line);margin-top:8px}
-.empty{align-self:center;justify-self:center;color:var(--muted);text-align:center}
-.composer{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:8px;padding:12px;border-top:1px solid var(--line);background:var(--panel);min-width:0}
-.composer textarea{min-height:46px;max-height:36svh;resize:vertical}
-.composer button{white-space:nowrap}
-.file-pill{position:relative;min-height:42px;border:1px solid var(--line);border-radius:7px;padding:0 13px;display:flex;align-items:center;justify-content:center;color:var(--fg);font-weight:700;cursor:pointer;overflow:hidden}
-.file-pill input{position:absolute;inset:0;opacity:0;cursor:pointer}
-.agent-shell{height:calc(100dvh - 64px)}
-.agent-pane{grid-template-rows:auto minmax(0,1fr) auto}
-.agent-status{color:var(--muted);font-weight:700;font-size:13px;white-space:nowrap}
-.agent-compose-wrap{border-top:1px solid var(--line);background:var(--panel)}
-.agent-quick{display:flex;gap:6px;overflow-x:auto;padding:8px 12px 0;scrollbar-width:thin}
-.agent-quick button{flex:0 0 auto;min-width:max-content;min-height:34px;padding:0 10px;white-space:nowrap;font-size:14px}
-.agent-composer{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:8px;padding:10px 12px 12px;min-width:0}
-.agent-composer textarea{min-height:52px;max-height:30dvh;resize:vertical}
-.attachment-link{display:inline-flex;align-items:center;min-height:34px;border:1px solid var(--line);border-radius:6px;padding:0 9px;margin-top:8px;color:var(--accent2);font-weight:800;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.message-log{color:var(--muted);font-size:13px}
-.login{width:min(420px,calc(100% - 32px));padding-top:72px}
-.login form,.download-form{display:grid;gap:10px;margin-top:18px}
-.error{color:var(--danger);font-weight:700}
-.download{max-width:760px}
-.jobs{display:grid;gap:8px;margin-top:14px}
-.job{display:flex;justify-content:space-between;gap:12px;border-bottom:1px solid var(--line);padding:10px 0}
-.job span{color:var(--muted)}
-.bar{height:12px;border:1px solid var(--line);border-radius:999px;overflow:hidden;margin:18px 0}
-#fill{height:100%;width:6%;background:var(--accent)}
-pre{white-space:pre-wrap;word-break:break-word;color:var(--muted);max-height:44vh;overflow:auto;border-top:1px solid var(--line);padding-top:12px}
-@media(max-width:760px){
-  body{font-size:14px}
-  nav,.hero{height:52px;padding:0 12px}
-  h1{font-size:22px}
-  main{width:calc(100% - 20px)}
-  .chat-shell{width:100%;height:calc(100dvh - 52px);padding:0;gap:0;grid-template-columns:1fr;grid-template-rows:auto minmax(0,1fr)}
-  .channel-rail{border-width:0 0 1px;border-radius:0;padding:8px;display:grid;grid-template-rows:auto auto;gap:7px;max-height:128px}
-  .agent-shell .rail-title{display:none}
-  .channel-list{display:flex;gap:6px;overflow-x:auto;overflow-y:hidden;padding-bottom:1px}
-  .channel-row{display:flex;flex:0 0 auto}
-  .channel-link{white-space:nowrap;min-height:34px;padding:0 9px;font-size:14px}
-  .channel-row .icon{display:none}
-  .slot-add-toggle{width:34px;min-height:34px}
-  .slot-add-form{padding-top:0;border-top:0;grid-template-columns:minmax(0,1fr) 38px}
-  .slot-add-form input{min-height:36px;padding:7px 9px}
-  .slot-add-form button{min-height:36px}
-  .channel-add{padding-top:6px}
-  .chat-pane{border:0;border-radius:0}
-  .chat-head{min-height:42px;padding:0 10px}
-  .chat-head strong{font-size:15px}
-  .chat-head span{font-size:12px}
-  .message-list{padding:8px 10px}
-  .message{grid-template-columns:32px minmax(0,1fr);gap:8px}
-  .message-avatar{width:32px;height:32px}
-  .composer{grid-template-columns:minmax(0,1fr) 88px;padding:10px}
-  .composer textarea{grid-column:1/-1;min-height:56px}
-  .agent-shell{height:calc(100dvh - 52px)}
-  .agent-quick{padding:7px 8px 0;gap:5px}
-  .agent-quick button{min-height:31px;padding:0 8px;font-size:13px}
-  .agent-composer{grid-template-columns:minmax(0,1fr) 74px;padding:7px 8px max(8px,env(safe-area-inset-bottom));gap:7px}
-  .agent-composer textarea{grid-column:1/-1;min-height:50px;max-height:22dvh;padding:8px 10px}
-  .agent-composer .file-pill{min-width:0}
-  .file-pill{min-width:0}
-}
-"#;
+const PAGE_CSS: &str = include_str!("page.css");
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -187,25 +77,8 @@ async fn main() -> io::Result<()> {
             }
             Ok(())
         }
-        "mbx" => {
-            mbx_cmd(&args[1..])?;
-            Ok(())
-        }
-        "import-motehold" => {
-            let Some(path) = args.get(1) else {
-                eprintln!("usage: plugdeck import-motehold /path/to/messages.db");
-                return Ok(());
-            };
-            let config = Config::from_env()?;
-            let conn = open_db(&config.db_path)?;
-            let imported = import_motehold(&conn, Path::new(path))?;
-            println!("imported {imported} motehold messages");
-            Ok(())
-        }
         _ => {
-            eprintln!(
-                "usage: plugdeck [serve|hash-password --stdin|audit-public|mbx|import-motehold <db>]"
-            );
+            eprintln!("usage: plugdeck [serve|hash-password --stdin|audit-public]");
             Ok(())
         }
     }
@@ -226,9 +99,11 @@ async fn serve() -> io::Result<()> {
         download_slots: Semaphore::new(1),
         agent_jobs: Mutex::new(HashMap::new()),
         agent_cancels: Mutex::new(HashMap::new()),
+        codex_index: Mutex::new(CodexIndexCache::default()),
     });
 
     state.set_download_slots();
+    refresh_codex_index(state.clone());
 
     let app = modules::build_router(state.clone());
 
@@ -251,6 +126,8 @@ struct Config {
     agent_upload_dir: PathBuf,
     agent_codex_bin: String,
     agent_codex_args: Vec<String>,
+    codex_home: PathBuf,
+    codex_reset_command: Option<Vec<String>>,
     agent_slots: Vec<AgentSlotSeed>,
     ytdlp: String,
     js_runtime: Option<PathBuf>,
@@ -274,6 +151,83 @@ struct AgentRun {
     status: String,
     current: String,
     started_at: String,
+}
+
+#[derive(Clone, Debug)]
+struct SlotRuntime {
+    label: String,
+}
+
+#[derive(Clone, Debug)]
+struct CodexConversation {
+    id: String,
+    title: String,
+    cwd: String,
+    updated_at: String,
+    path: PathBuf,
+    preview: String,
+    message_count: usize,
+}
+
+#[derive(Clone, Debug)]
+struct CodexProject {
+    path: String,
+    name: String,
+    trusted: bool,
+    conversation_count: usize,
+}
+
+#[derive(Clone, Debug)]
+struct CodexIndex {
+    conversations: Vec<CodexConversation>,
+    projects: Vec<CodexProject>,
+    usage: Option<CodexUsageSnapshot>,
+}
+
+impl CodexIndex {
+    fn empty() -> Self {
+        Self {
+            conversations: Vec::new(),
+            projects: Vec::new(),
+            usage: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CodexUsageSnapshot {
+    observed_at: String,
+    plan_type: String,
+    total_units: i64,
+    last_units: i64,
+    cached_input_units: i64,
+    context_window: i64,
+    primary: Option<CodexRateWindow>,
+    secondary: Option<CodexRateWindow>,
+    credits: Option<String>,
+    reset_credits: Option<CodexResetCreditsSummary>,
+}
+
+#[derive(Clone, Debug)]
+struct CodexRateWindow {
+    label: String,
+    used_percent: f64,
+    remaining_percent: f64,
+    window_minutes: i64,
+    resets_at: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+struct CodexResetCreditsSummary {
+    available_count: i64,
+    estimate: Option<codex_reset_ledger::ResetCreditEstimate>,
+}
+
+#[derive(Default)]
+struct CodexIndexCache {
+    snapshot: Option<CodexIndex>,
+    refreshed_at: Option<Instant>,
+    refreshing: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -315,11 +269,18 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|_| download_dir.join("agent-uploads"));
         let agent_codex_bin =
-            env::var("PLUGDECK_AGENT_CODEX_BIN").unwrap_or_else(|_| "codex".into());
+            env::var("PLUGDECK_AGENT_CODEX_BIN").unwrap_or_else(|_| default_codex_bin());
         let agent_codex_args = env::var("PLUGDECK_AGENT_CODEX_ARGS")
             .ok()
             .map(|value| split_env_args(&value))
             .unwrap_or_default();
+        let codex_home = env::var("CODEX_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| default_home_dir().join(".codex"));
+        let codex_reset_command = env::var("PLUGDECK_CODEX_RESET_COMMAND")
+            .ok()
+            .map(|value| split_env_args(&value))
+            .filter(|parts| !parts.is_empty());
         let agent_slots = parse_agent_slot_seeds(
             env::var("PLUGDECK_AGENT_SLOTS").ok(),
             &agent_default_workdir,
@@ -372,6 +333,8 @@ impl Config {
             agent_upload_dir,
             agent_codex_bin,
             agent_codex_args,
+            codex_home,
+            codex_reset_command,
             agent_slots,
             ytdlp,
             js_runtime,
@@ -393,6 +356,7 @@ struct AppState {
     download_slots: Semaphore,
     agent_jobs: Mutex<HashMap<i64, AgentRun>>,
     agent_cancels: Mutex<HashMap<i64, oneshot::Sender<()>>>,
+    codex_index: Mutex<CodexIndexCache>,
 }
 
 impl AppState {
@@ -402,6 +366,67 @@ impl AppState {
             self.download_slots
                 .add_permits(self.config.max_active.saturating_sub(current));
         }
+    }
+}
+
+fn codex_index_snapshot(state: &Arc<AppState>) -> Option<CodexIndex> {
+    let (snapshot, should_refresh) = {
+        let mut cache = state.codex_index.lock().unwrap();
+        let stale = cache
+            .refreshed_at
+            .is_none_or(|refreshed_at| refreshed_at.elapsed() >= CODEX_INDEX_REFRESH_AFTER);
+        let should_refresh = stale && !cache.refreshing;
+        if should_refresh {
+            cache.refreshing = true;
+        }
+        (cache.snapshot.clone(), should_refresh)
+    };
+    if should_refresh {
+        refresh_codex_index(state.clone());
+    }
+    snapshot
+}
+
+fn refresh_codex_index(state: Arc<AppState>) {
+    {
+        let mut cache = state.codex_index.lock().unwrap();
+        cache.refreshing = true;
+    }
+    tokio::task::spawn_blocking(move || {
+        let index = load_codex_index_for_state(&state);
+        let mut cache = state.codex_index.lock().unwrap();
+        cache.snapshot = Some(index);
+        cache.refreshed_at = Some(Instant::now());
+        cache.refreshing = false;
+    });
+}
+
+fn refresh_codex_index_blocking(state: &Arc<AppState>) -> CodexIndex {
+    let index = load_codex_index_for_state(state);
+    let mut cache = state.codex_index.lock().unwrap();
+    cache.snapshot = Some(index.clone());
+    cache.refreshed_at = Some(Instant::now());
+    cache.refreshing = false;
+    index
+}
+
+fn load_codex_index_for_state(state: &Arc<AppState>) -> CodexIndex {
+    let mut index = load_codex_index(&state.config);
+    attach_codex_reset_credit_estimate(state, &mut index);
+    index
+}
+
+fn attach_codex_reset_credit_estimate(state: &Arc<AppState>, index: &mut CodexIndex) {
+    let Some(summary) = index
+        .usage
+        .as_mut()
+        .and_then(|usage| usage.reset_credits.as_mut())
+    else {
+        return;
+    };
+    let db = state.db.lock().unwrap();
+    if let Ok(estimate) = codex_reset_ledger::reconcile(&db, summary.available_count, Utc::now()) {
+        summary.estimate = Some(estimate);
     }
 }
 
@@ -451,70 +476,7 @@ fn open_db(path: &Path) -> io::Result<Connection> {
         fs::create_dir_all(parent)?;
     }
     let conn = Connection::open(path).map_err(io_other)?;
-    conn.execute_batch(
-        r#"
-        PRAGMA foreign_keys = ON;
-        CREATE TABLE IF NOT EXISTS channels (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL COLLATE NOCASE UNIQUE,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS notes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            channel_id INTEGER NOT NULL,
-            body TEXT NOT NULL,
-            image_type TEXT,
-            image_data BLOB,
-            created_at TEXT NOT NULL,
-            import_source TEXT UNIQUE,
-            FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
-        );
-        CREATE INDEX IF NOT EXISTS idx_notes_channel_id ON notes(channel_id);
-        CREATE TABLE IF NOT EXISTS download_cache (
-            cache_key TEXT PRIMARY KEY,
-            file_path TEXT NOT NULL,
-            filename TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS agent_slots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL COLLATE NOCASE UNIQUE,
-            workdir TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS agent_sessions (
-            slot_id INTEGER PRIMARY KEY,
-            thread_id TEXT NOT NULL,
-            workdir TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            FOREIGN KEY (slot_id) REFERENCES agent_slots(id) ON DELETE CASCADE
-        );
-        CREATE TABLE IF NOT EXISTS agent_attachments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            slot_id INTEGER NOT NULL,
-            original_name TEXT NOT NULL,
-            stored_name TEXT NOT NULL,
-            content_type TEXT NOT NULL,
-            file_path TEXT NOT NULL,
-            size_bytes INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (slot_id) REFERENCES agent_slots(id) ON DELETE CASCADE
-        );
-        CREATE TABLE IF NOT EXISTS agent_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            slot_id INTEGER NOT NULL,
-            role TEXT NOT NULL,
-            body TEXT NOT NULL,
-            attachment_id INTEGER,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (slot_id) REFERENCES agent_slots(id) ON DELETE CASCADE,
-            FOREIGN KEY (attachment_id) REFERENCES agent_attachments(id) ON DELETE SET NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_agent_messages_slot_id ON agent_messages(slot_id, id);
-        CREATE INDEX IF NOT EXISTS idx_agent_attachments_slot_id ON agent_attachments(slot_id);
-        "#,
-    )
-    .map_err(io_other)?;
+    db_migrations::migrate(&conn).map_err(io_other)?;
     ensure_channel(&conn, DEFAULT_CHANNEL).map_err(io_other)?;
     Ok(conn)
 }
@@ -930,12 +892,19 @@ async fn note_image(
 #[derive(Deserialize)]
 struct AgentsQuery {
     slot: Option<i64>,
+    project: Option<String>,
+    thread: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct AgentSlotForm {
-    name: String,
-    workdir: Option<String>,
+struct AgentConversationForm {
+    thread_id: String,
+    workdir: String,
+}
+
+#[derive(Deserialize)]
+struct CodexResetForm {
+    confirm: String,
 }
 
 struct PendingUpload {
@@ -949,30 +918,6 @@ struct AgentSlotRow {
     id: i64,
     name: String,
     workdir: String,
-}
-
-#[derive(Debug, Clone)]
-struct MbxSlot {
-    id: Option<i64>,
-    name: String,
-    workdir: String,
-    thread_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MbxAction {
-    Start,
-    New,
-    Resume,
-}
-
-struct MbxRunOptions {
-    workdir: Option<PathBuf>,
-    prompt: Vec<String>,
-    attach: bool,
-    restart: bool,
-    dry_run: bool,
-    unsafe_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -998,6 +943,7 @@ struct AgentSlotPoll {
     current: String,
     message_count: usize,
     messages_html: String,
+    active_status: String,
 }
 
 async fn agents_page(
@@ -1019,83 +965,111 @@ async fn agents_page(
     let Some(active_slot) = active_slot else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "missing agent slot").into_response();
     };
+    let mut codex_snapshot = codex_index_snapshot(&state);
+    let saved_thread = {
+        let db = state.db.lock().unwrap();
+        agent_session(&db, active_slot.id)
+            .unwrap_or(None)
+            .map(|(thread_id, _)| thread_id)
+    };
+    let selected_thread = query.thread.clone().or_else(|| {
+        if query.project.is_none() {
+            saved_thread
+        } else {
+            None
+        }
+    });
+    if selected_thread.as_ref().is_some_and(|thread_id| {
+        codex_snapshot
+            .as_ref()
+            .is_none_or(|index| codex_conversation_by_id(index, thread_id).is_none())
+    }) {
+        codex_snapshot = Some(refresh_codex_index_blocking(&state));
+    }
+    let codex_loaded = codex_snapshot.is_some();
+    let codex = codex_snapshot.unwrap_or_else(CodexIndex::empty);
     let messages = {
         let db = state.db.lock().unwrap();
         list_agent_messages(&db, active_slot.id).unwrap_or_default()
     };
-    let run = agent_run_for(&state, active_slot.id);
-    let status_text = run
-        .as_ref()
-        .map(|run| {
-            if run.current.trim().is_empty() {
-                run.status.clone()
-            } else {
-                run.current.clone()
-            }
-        })
-        .unwrap_or_else(|| "idle".into());
-    let slots_html = agent_slots_html(&slots, active_slot.id);
-    let messages_html = agent_messages_html(&messages);
-    let active_slot_name = html_escape(&active_slot.name);
-    let message_count = messages.len();
+    let runtime = agent_slot_runtime(&state, active_slot);
+    let browser_drawer = codex_browser_drawer_html(
+        &codex.projects,
+        &codex.conversations,
+        active_slot.id,
+        selected_thread.as_deref(),
+        codex_loaded,
+    );
+    let messages_html = selected_thread
+        .as_deref()
+        .and_then(|thread_id| codex_transcript_html(&codex, thread_id).ok())
+        .unwrap_or_else(|| agent_messages_html(&messages));
+    let active_title = selected_thread
+        .as_deref()
+        .and_then(|thread_id| codex_conversation_by_id(&codex, thread_id))
+        .map(|conversation| conversation.title.clone())
+        .unwrap_or_else(|| "Codex".into());
+    let active_title = html_escape(&active_title);
+    let active_slot_workdir = html_escape(&active_slot.workdir);
+    let message_count = if selected_thread.is_some() {
+        codex_transcript_count(&messages_html).unwrap_or(messages.len())
+    } else {
+        messages.len()
+    };
+    let usage_dialog = codex_usage_dialog(&state.config, codex.usage.as_ref(), codex_loaded);
+    let viewing_transcript = selected_thread.is_some();
     page(
         "Agents",
         &format!(
             r##"
-<nav><a href="/">Plugdeck</a><strong>Agents</strong></nav>
-<main class="chat-shell agent-shell">
-  <aside class="channel-rail" aria-label="Slots">
-    <div class="rail-title">Slots</div>
-    <div class="channel-list">{slots_html}<button type="button" class="ghost slot-add-toggle" data-slot-add-toggle aria-label="Add slot" aria-expanded="false" aria-controls="slotAddPanel">+</button></div>
-    <form action="/agents/slots" method="post" class="slot-add-form" id="slotAddPanel" hidden>
-      <input name="name" maxlength="{MAX_AGENT_SLOT_CHARS}" placeholder="new slot" aria-label="New slot name" data-slot-add-input required>
-      <button type="submit" aria-label="Add slot">+</button>
-    </form>
-  </aside>
+<nav><a href="/">Plugdeck</a><div class="nav-actions"><button type="button" class="ghost" data-browser-open>Browse</button><button type="button" class="ghost" data-codex-open>Usage</button><strong>Agents</strong></div></nav>
+<main class="chat-shell agent-shell agent-single">
   <section class="chat-pane agent-pane">
-    <header class="chat-head"><strong># {active_slot_name}</strong><span data-agent-count>{message_count} messages</span><span class="agent-status" data-agent-status>{}</span></header>
+    <header class="chat-head">
+      <div class="chat-title"><strong>{active_title}</strong><span>{active_slot_workdir}</span></div>
+      <div class="chat-stats"><span data-agent-count>{message_count} messages</span><span class="agent-status" data-agent-status>{}</span></div>
+    </header>
     <div class="message-list" data-agent-messages>{messages_html}</div>
     <section class="agent-compose-wrap">
-      <div class="agent-quick">
-        <button type="button" data-agent-cmd="!status">stat</button>
-        <button type="button" data-agent-cmd="!pwd">pwd</button>
-        <button type="button" data-agent-cmd="!ls">ls</button>
-        <button type="button" data-agent-cmd="!slots">slots</button>
-        <button type="button" data-agent-cmd="!fresh">fresh</button>
-        <button type="button" data-agent-cmd="!stayfresh" aria-label="stayfresh" title="stayfresh">stay</button>
-        <button type="button" data-agent-cmd="!stop">stop</button>
-      </div>
       <form action="/agents" method="post" enctype="multipart/form-data" class="agent-composer">
         <input name="slot_id" type="hidden" value="{}">
-        <textarea id="agentBody" name="body" maxlength="{MAX_AGENT_MESSAGE_CHARS}" placeholder="Message #{active_slot_name}"></textarea>
+        <textarea id="agentBody" name="body" maxlength="{MAX_AGENT_MESSAGE_CHARS}" placeholder="Message Codex"></textarea>
         <label class="file-pill"><input name="attachment" type="file" accept="image/*,.pdf,.txt,.md,.csv,.json,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip,application/pdf,text/*"><span>Attach</span></label>
         <button type="submit">Send</button>
       </form>
     </section>
   </section>
 </main>
+{browser_drawer}
+{usage_dialog}
 <script>
 (() => {{
   const list = document.querySelector("[data-agent-messages]");
   const status = document.querySelector("[data-agent-status]");
   const count = document.querySelector("[data-agent-count]");
   const input = document.getElementById("agentBody");
-  const addToggle = document.querySelector("[data-slot-add-toggle]");
-  const addPanel = document.getElementById("slotAddPanel");
-  const addInput = document.querySelector("[data-slot-add-input]");
-  if (addToggle && addPanel) {{
-    addToggle.addEventListener("click", () => {{
-      const open = addPanel.hasAttribute("hidden");
-      addPanel.toggleAttribute("hidden", !open);
-      addToggle.setAttribute("aria-expanded", String(open));
-      if (open && addInput) setTimeout(() => addInput.focus(), 0);
-    }});
-  }}
-  document.querySelectorAll("[data-agent-cmd]").forEach((button) => {{
+  const viewingTranscript = {viewing_transcript};
+  const codexPanel = document.getElementById("codexPanel");
+  document.querySelector("[data-codex-open]")?.addEventListener("click", () => {{
+    if (codexPanel && typeof codexPanel.showModal === "function") codexPanel.showModal();
+  }});
+  document.querySelector("[data-codex-close]")?.addEventListener("click", () => codexPanel?.close());
+  const browserPanel = document.getElementById("conversationDrawer");
+  document.querySelector("[data-browser-open]")?.addEventListener("click", () => {{
+    if (browserPanel && typeof browserPanel.showModal === "function") browserPanel.showModal();
+  }});
+  document.querySelector("[data-browser-close]")?.addEventListener("click", () => browserPanel?.close());
+  document.querySelectorAll("[data-load-more]").forEach((button) => {{
     button.addEventListener("click", () => {{
-      input.value = button.dataset.agentCmd || "";
-      try {{ input.focus({{preventScroll:true}}); }} catch (_) {{ input.focus(); }}
+      const group = button.closest("[data-project-group]");
+      if (!group) return;
+      group.querySelectorAll("[data-extra-conversation]").forEach((row) => row.hidden = false);
+      button.hidden = true;
     }});
+  }});
+  document.querySelector("[data-reset-form]")?.addEventListener("submit", (event) => {{
+    const ok = window.confirm("Use a Codex reset now? This cannot be undone.");
+    if (!ok) event.preventDefault();
   }});
   let dirty = false;
   input.addEventListener("input", () => {{ dirty = input.value.length > 0; }});
@@ -1111,7 +1085,7 @@ async fn agents_page(
       if (response.ok) {{
         const data = await response.json();
         list.innerHTML = data.messages_html;
-        status.textContent = data.running ? (data.current || "running") : "idle";
+        status.textContent = data.active_status || (data.running ? (data.current || "running") : "idle");
         count.textContent = data.message_count + " messages";
         if (nearBottom) list.scrollTop = list.scrollHeight;
         setTimeout(poll, data.running ? 1200 : 4000);
@@ -1121,60 +1095,131 @@ async fn agents_page(
     setTimeout(poll, 4000);
   }}
   if (list) list.scrollTop = list.scrollHeight;
-  setTimeout(poll, 1200);
+  if (!viewingTranscript) setTimeout(poll, 1200);
 }})();
 </script>
 "##,
-            html_escape(&status_text),
+            html_escape(&runtime.label),
             active_slot.id,
             active_slot.id
         ),
     )
 }
 
-async fn agent_slot_create(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Form(form): Form<AgentSlotForm>,
-) -> Response {
-    if let Some(response) = page_guard(&state, &headers) {
-        return response;
-    }
-    let name = normalize_agent_slot_name(&form.name);
-    let workdir = form
-        .workdir
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(expand_local_path)
-        .unwrap_or_else(|| state.config.agent_default_workdir.clone());
-    let mut slot_id = None;
-    if !name.is_empty() && name.chars().count() <= MAX_AGENT_SLOT_CHARS && workdir.is_dir() {
-        let db = state.db.lock().unwrap();
-        slot_id = ensure_agent_slot(&db, &name, &workdir).ok();
-    }
-    Redirect::to(&agent_location(slot_id)).into_response()
-}
-
-async fn agent_slot_delete(
+async fn agent_conversation_load(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     AxumPath(id): AxumPath<i64>,
+    Form(form): Form<AgentConversationForm>,
 ) -> Response {
     if let Some(response) = page_guard(&state, &headers) {
         return response;
     }
-    if let Some(cancel) = state.agent_cancels.lock().unwrap().remove(&id) {
-        let _ = cancel.send(());
+    let mut codex = codex_index_snapshot(&state);
+    if codex
+        .as_ref()
+        .is_none_or(|index| codex_conversation_by_id(index, &form.thread_id).is_none())
+    {
+        codex = Some(refresh_codex_index_blocking(&state));
     }
-    let db = state.db.lock().unwrap();
-    let slot_count: i64 = db
-        .query_row("SELECT COUNT(*) FROM agent_slots", [], |row| row.get(0))
-        .unwrap_or(0);
-    if slot_count > 1 {
-        let _ = db.execute("DELETE FROM agent_slots WHERE id = ?1", params![id]);
+    let codex_loaded = codex.is_some();
+    let conversation = codex
+        .as_ref()
+        .and_then(|index| codex_conversation_by_id(index, &form.thread_id));
+    if codex_loaded && conversation.is_none() {
+        return Redirect::to(&agent_location(Some(id))).into_response();
     }
-    Redirect::to("/agents").into_response()
+    let requested_workdir = expand_local_path(&form.workdir);
+    let workdir = if requested_workdir.is_dir() {
+        requested_workdir
+            .canonicalize()
+            .unwrap_or_else(|_| requested_workdir.clone())
+    } else if let Some(conversation) = conversation {
+        expand_local_path(&conversation.cwd)
+    } else {
+        return Redirect::to(&agent_location(Some(id))).into_response();
+    };
+    if !workdir.is_dir() {
+        return Redirect::to(&agent_location(Some(id))).into_response();
+    }
+    {
+        let db = state.db.lock().unwrap();
+        let _ = db.execute(
+            "UPDATE agent_slots SET workdir = ?1 WHERE id = ?2",
+            params![workdir.to_string_lossy(), id],
+        );
+        let _ = set_agent_session(&db, id, &form.thread_id, &workdir.to_string_lossy());
+    }
+    Redirect::to(&format!(
+        "{}&thread={}",
+        agent_location(Some(id)),
+        url_encode(&form.thread_id)
+    ))
+    .into_response()
+}
+
+async fn codex_reset_post(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<CodexResetForm>,
+) -> Response {
+    if let Some(response) = page_guard(&state, &headers) {
+        return response;
+    }
+    if form.confirm.trim() != "USE_RESET" {
+        return (StatusCode::BAD_REQUEST, "confirmation required").into_response();
+    }
+    if let Some(command) = &state.config.codex_reset_command {
+        let Some((program, args)) = command.split_first() else {
+            return (StatusCode::CONFLICT, "no reset command configured").into_response();
+        };
+        let output = StdCommand::new(program).args(args).output();
+        return match output {
+            Ok(output) if output.status.success() => {
+                refresh_codex_index(state.clone());
+                Redirect::to("/agents").into_response()
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("reset command failed: {}", truncate_text(&stderr, 1000)),
+                )
+                    .into_response()
+            }
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not start reset command: {err}"),
+            )
+                .into_response(),
+        };
+    }
+    match consume_codex_rate_limit_reset_credit(&state.config) {
+        Some(outcome) if outcome == "reset" || outcome == "alreadyRedeemed" => {
+            refresh_codex_index(state.clone());
+            Redirect::to("/agents").into_response()
+        }
+        Some(outcome) if outcome == "nothingToReset" => (
+            StatusCode::CONFLICT,
+            "no current Codex limit window is eligible for reset",
+        )
+            .into_response(),
+        Some(outcome) if outcome == "noCredit" => (
+            StatusCode::CONFLICT,
+            "Codex reports no reset credits available",
+        )
+            .into_response(),
+        Some(outcome) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unexpected Codex reset outcome: {outcome}"),
+        )
+            .into_response(),
+        None => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not ask Codex to use a reset credit",
+        )
+            .into_response(),
+    }
 }
 
 async fn agent_message_create(
@@ -1289,11 +1334,19 @@ async fn agent_slot_state(
         list_agent_messages(&db, id).unwrap_or_default()
     };
     let run = agent_run_for(&state, id);
+    let active_status = {
+        let db = state.db.lock().unwrap();
+        get_agent_slot(&db, id)
+            .unwrap_or(None)
+            .map(|slot| agent_slot_runtime(&state, &slot).label)
+            .unwrap_or_else(|| "idle".into())
+    };
     Json(AgentSlotPoll {
         running: run.is_some(),
         current: run.map(|run| run.current).unwrap_or_default(),
         message_count: messages.len(),
         messages_html: agent_messages_html(&messages),
+        active_status,
     })
     .into_response()
 }
@@ -1387,27 +1440,18 @@ fn agent_run_for(state: &AppState, slot_id: i64) -> Option<AgentRun> {
     state.agent_jobs.lock().unwrap().get(&slot_id).cloned()
 }
 
-fn agent_slots_html(slots: &[AgentSlotRow], active_id: i64) -> String {
-    slots
-        .iter()
-        .map(|slot| {
-            let active_class = if slot.id == active_id { " active" } else { "" };
-            let slot_name = html_escape(&slot.name);
-            let delete = if slots.len() > 1 {
-                format!(
-                    r#"<form action="/agents/slots/{}/delete" method="post"><button class="icon danger-icon" type="submit" aria-label="Delete slot {}">x</button></form>"#,
-                    slot.id, slot_name
-                )
-            } else {
-                String::new()
-            };
-            format!(
-                r##"<div class="channel-row{active_class}"><a class="channel-link" href="/agents?slot={}"><span>#</span>{}</a>{}</div>"##,
-                slot.id, slot_name, delete
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("")
+fn agent_slot_runtime(state: &AppState, slot: &AgentSlotRow) -> SlotRuntime {
+    if let Some(run) = agent_run_for(state, slot.id) {
+        let label = if run.current.trim().is_empty() {
+            run.status
+        } else {
+            run.current
+        };
+        return SlotRuntime { label };
+    }
+    SlotRuntime {
+        label: "idle".into(),
+    }
 }
 
 fn agent_messages_html(messages: &[AgentMessageRow]) -> String {
@@ -1461,6 +1505,319 @@ fn agent_messages_html(messages: &[AgentMessageRow]) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn codex_browser_drawer_html(
+    projects: &[CodexProject],
+    conversations: &[CodexConversation],
+    slot_id: i64,
+    active_thread: Option<&str>,
+    loaded: bool,
+) -> String {
+    let mut groups = Vec::new();
+    for project in projects
+        .iter()
+        .filter(|project| project.conversation_count > 0)
+        .take(CODEX_PROJECT_DRAWER_LIMIT)
+    {
+        let project_conversations = conversations
+            .iter()
+            .filter(|conversation| conversation.cwd == project.path)
+            .take(CODEX_PROJECT_CONVERSATION_LIMIT)
+            .collect::<Vec<_>>();
+        if project_conversations.is_empty() {
+            continue;
+        }
+        let rows = project_conversations
+            .iter()
+            .enumerate()
+            .map(|(index, conversation)| {
+                let active_class = if Some(conversation.id.as_str()) == active_thread {
+                    " active"
+                } else {
+                    ""
+                };
+                let extra_attr = if index >= CODEX_PROJECT_VISIBLE_CONVERSATIONS {
+                    " data-extra-conversation hidden"
+                } else {
+                    ""
+                };
+                let title = html_escape(&conversation.title);
+                let preview = html_escape(&truncate_text(&conversation.preview, 92));
+                let updated = html_escape(&short_time(&conversation.updated_at));
+                let workdir = html_escape(&conversation.cwd);
+                let thread_id = html_escape(&conversation.id);
+                format!(
+                    r#"<form class="browser-conversation-row{active_class}"{extra_attr} action="/agents/slots/{slot_id}/conversation" method="post">
+  <input type="hidden" name="thread_id" value="{thread_id}">
+  <input type="hidden" name="workdir" value="{workdir}">
+  <button type="submit"><strong>{title}</strong><span>{updated} · {} msgs · {preview}</span></button>
+</form>"#,
+                    conversation.message_count
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        let hidden = project_conversations
+            .len()
+            .saturating_sub(CODEX_PROJECT_VISIBLE_CONVERSATIONS);
+        let more = if hidden > 0 {
+            format!(
+                r#"<button type="button" class="ghost browser-more" data-load-more>Load more ({hidden})</button>"#
+            )
+        } else {
+            String::new()
+        };
+        let trust = if project.trusted {
+            "trusted"
+        } else {
+            "project"
+        };
+        groups.push(format!(
+            r#"<section class="browser-project" data-project-group>
+  <div class="browser-project-head" title="{}"><strong>{}</strong><span>{} chats · {trust}</span></div>
+  <div class="browser-conversations">{rows}</div>
+  {more}
+</section>"#,
+            html_escape(&project.path),
+            html_escape(&project.name),
+            project.conversation_count
+        ));
+    }
+    let body = if !loaded {
+        r#"<p class="empty">Loading saved Codex conversations...</p>"#.into()
+    } else if groups.is_empty() {
+        r#"<p class="empty">No saved Codex conversations found yet.</p>"#.into()
+    } else {
+        groups.join("")
+    };
+    format!(
+        r#"<dialog class="browser-drawer" id="conversationDrawer">
+  <header><div><strong>Conversations</strong><br><span>Projects with saved Codex sessions</span></div><button type="button" class="icon" data-browser-close aria-label="Close">x</button></header>
+  <main class="browser-scroll">{body}</main>
+</dialog>"#
+    )
+}
+
+fn codex_usage_dialog(config: &Config, usage: Option<&CodexUsageSnapshot>, loaded: bool) -> String {
+    let command = html_escape(&agent_command_label(config));
+    let reset_available = usage
+        .and_then(|usage| usage.reset_credits.as_ref())
+        .is_some_and(|credits| credits.available_count > 0);
+    let reset = if config.codex_reset_command.is_some() || reset_available {
+        r#"<form class="reset-form" action="/agents/codex/reset" method="post" data-reset-form>
+  <input type="hidden" name="confirm" value="USE_RESET">
+  <button type="submit" class="danger-icon ghost">Use reset</button>
+</form>"#
+            .to_string()
+    } else {
+        r#"<button type="button" class="ghost" disabled title="No Codex reset credits are currently reported.">Use reset</button>"#.to_string()
+    };
+    let body = if let Some(usage) = usage {
+        let primary = usage_window_card("Primary", usage.primary.as_ref());
+        let secondary = usage_window_card("Secondary", usage.secondary.as_ref());
+        let reset_credit_text = codex_reset_credit_text(usage.reset_credits.as_ref());
+        let reset_lines = [
+            usage_reset_line("Primary", usage.primary.as_ref()),
+            usage_reset_line("Secondary", usage.secondary.as_ref()),
+        ]
+        .join("");
+        format!(
+            r#"<p class="muted">Launcher: <strong>{command}</strong></p>
+<section class="usage-total">
+  <strong>Total usage</strong>
+  <span>Plan: {}</span>
+  <span>Total tokens recorded: {}</span>
+  <span>Last turn: {} · cached input: {}</span>
+  <span>Context window: {}</span>
+  <span>Add-on credits: {}</span>
+  <span>Usage reset credits: {reset_credit_text}</span>
+</section>
+<div class="usage-grid">{primary}{secondary}</div>
+<section class="usage-total"><strong>Reset windows</strong>{reset_lines}</section>
+<p class="muted">Observed {}</p>
+            {reset}"#,
+            html_escape(&usage.plan_type),
+            format_number(usage.total_units),
+            format_number(usage.last_units),
+            format_number(usage.cached_input_units),
+            format_number(usage.context_window),
+            html_escape(usage.credits.as_deref().unwrap_or("not reported")),
+            html_escape(&short_time(&usage.observed_at)),
+        )
+    } else if loaded {
+        format!(
+            r#"<p class="muted">No Codex usage event has been recorded yet. Open `/status` in Codex once and Plugdeck will show the saved rate-limit data here.</p><p>Launcher: <strong>{command}</strong></p>{reset}"#
+        )
+    } else {
+        format!(
+            r#"<p class="muted">Loading Codex usage from saved sessions...</p><p>Launcher: <strong>{command}</strong></p>{reset}"#
+        )
+    };
+    format!(
+        r#"<dialog class="codex-panel" id="codexPanel">
+  <header><strong>Codex Usage</strong><button type="button" class="icon" data-codex-close aria-label="Close">x</button></header>
+  <main>{body}</main>
+</dialog>"#
+    )
+}
+
+fn usage_window_card(fallback_label: &str, window: Option<&CodexRateWindow>) -> String {
+    let Some(window) = window else {
+        return format!(
+            r#"<section class="usage-card"><strong>{fallback_label}</strong><span class="muted">not reported</span></section>"#
+        );
+    };
+    let used = window.used_percent.clamp(0.0, 100.0);
+    let remaining = window.remaining_percent.clamp(0.0, 100.0);
+    let reset = window
+        .resets_at
+        .and_then(epoch_to_rfc3339)
+        .map(|value| short_time(&value))
+        .unwrap_or_else(|| "unknown".into());
+    format!(
+        r#"<section class="usage-card"><strong>{}</strong><span>{:.0}% remaining · {:.0}% used</span><div class="meter" title="{:.0}% remaining"><span style="width:{:.0}%"></span></div><span class="muted">{} window · resets {}</span></section>"#,
+        html_escape(&window.label),
+        remaining,
+        used,
+        remaining,
+        remaining,
+        html_escape(&usage_window_duration(window.window_minutes)),
+        html_escape(&reset)
+    )
+}
+
+fn usage_reset_line(fallback_label: &str, window: Option<&CodexRateWindow>) -> String {
+    let Some(window) = window else {
+        return format!(r#"<span>{fallback_label}: not reported</span>"#);
+    };
+    let reset = window
+        .resets_at
+        .and_then(epoch_to_rfc3339)
+        .map(|value| short_time(&value))
+        .unwrap_or_else(|| "unknown".into());
+    format!(
+        r#"<span>{}: {} window resets {}</span>"#,
+        html_escape(&window.label),
+        html_escape(&usage_window_duration(window.window_minutes)),
+        html_escape(&reset)
+    )
+}
+
+fn codex_reset_credit_text(credits: Option<&CodexResetCreditsSummary>) -> String {
+    let Some(credits) = credits else {
+        return "not reported by Codex".into();
+    };
+    let count = credits.available_count;
+    let label = if count == 1 { "credit" } else { "credits" };
+    let Some(estimate) = &credits.estimate else {
+        return format!("{count} {label} available · local expiry tracking not initialized yet");
+    };
+    let mut parts = vec![format!("{count} {label} available")];
+    if estimate.tracked_available_count > 0 {
+        let tracked_label = if estimate.tracked_available_count == 1 {
+            "tracked credit"
+        } else {
+            "tracked credits"
+        };
+        let mut tracked = format!("{} {tracked_label}", estimate.tracked_available_count);
+        if let Some(next_expires_at) = &estimate.next_expires_at {
+            tracked.push_str(&format!(" · next expires {}", short_time(next_expires_at)));
+        }
+        parts.push(tracked);
+    }
+    if estimate.untracked_available_count > 0 {
+        let untracked_label = if estimate.untracked_available_count == 1 {
+            "existing credit"
+        } else {
+            "existing credits"
+        };
+        parts.push(format!(
+            "{} {untracked_label} from before tracking; expiry unknown",
+            estimate.untracked_available_count
+        ));
+    }
+    if estimate.tracked_available_count == 0 && estimate.untracked_available_count == 0 {
+        parts.push("tracking future grants".into());
+    }
+    parts.join(" · ")
+}
+
+fn usage_window_duration(minutes: i64) -> String {
+    if minutes >= 1440 && minutes % 1440 == 0 {
+        return format!("{}d", minutes / 1440);
+    }
+    if minutes >= 60 && minutes % 60 == 0 {
+        return format!("{}h", minutes / 60);
+    }
+    format!("{minutes}m")
+}
+
+fn codex_usage_text(usage: Option<&CodexUsageSnapshot>) -> String {
+    let Some(usage) = usage else {
+        return "Codex usage: no saved `/status` data found yet.".into();
+    };
+    let mut lines = vec![
+        "Codex usage:".to_string(),
+        format!("- observed: {}", short_time(&usage.observed_at)),
+        format!("- plan: {}", usage.plan_type),
+        format!("- total tokens: {}", format_number(usage.total_units)),
+        format!("- last turn: {}", format_number(usage.last_units)),
+        format!(
+            "- cached input: {}",
+            format_number(usage.cached_input_units)
+        ),
+        format!("- context window: {}", format_number(usage.context_window)),
+        format!(
+            "- add-on credits: {}",
+            usage.credits.as_deref().unwrap_or("not reported")
+        ),
+        format!(
+            "- usage reset credits: {}",
+            codex_reset_credit_text(usage.reset_credits.as_ref())
+        ),
+    ];
+    if let Some(primary) = &usage.primary {
+        lines.push(format!(
+            "- primary: {:.0}% left, {:.0}% used, resets {}",
+            primary.remaining_percent,
+            primary.used_percent,
+            primary
+                .resets_at
+                .and_then(epoch_to_rfc3339)
+                .map(|value| short_time(&value))
+                .unwrap_or_else(|| "unknown".into())
+        ));
+    }
+    if let Some(secondary) = &usage.secondary {
+        lines.push(format!(
+            "- secondary: {:.0}% left, {:.0}% used, resets {}",
+            secondary.remaining_percent,
+            secondary.used_percent,
+            secondary
+                .resets_at
+                .and_then(epoch_to_rfc3339)
+                .map(|value| short_time(&value))
+                .unwrap_or_else(|| "unknown".into())
+        ));
+    }
+    lines.join("\n")
+}
+
+fn codex_transcript_html(index: &CodexIndex, thread_id: &str) -> io::Result<String> {
+    let Some(conversation) = codex_conversation_by_id(&index, thread_id) else {
+        return Ok(r#"<p class="empty">Conversation not found.</p>"#.into());
+    };
+    let messages = codex_transcript_messages(&conversation.path)?;
+    if messages.is_empty() {
+        return Ok(r#"<p class="empty">This Codex conversation has no visible user or assistant messages yet.</p>"#.into());
+    }
+    Ok(agent_messages_html(&messages))
+}
+
+fn codex_transcript_count(html: &str) -> Option<usize> {
+    let count = html.matches("<article class=\"message\">").count();
+    (count > 0).then_some(count)
 }
 
 fn list_agent_slots(db: &Connection) -> rusqlite::Result<Vec<AgentSlotRow>> {
@@ -1631,28 +1988,31 @@ fn handle_agent_control(state: &Arc<AppState>, slot: &AgentSlotRow, body: &str) 
         return true;
     }
     if lower == "status" {
-        let run = agent_run_for(state, slot.id);
-        let status = run
-            .as_ref()
-            .map(|run| run.current.as_str())
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or(if run.is_some() { "running" } else { "idle" });
+        let runtime = agent_slot_runtime(state, slot);
+        let usage = codex_index_snapshot(state).and_then(|index| index.usage);
         append_agent_assistant(
             state,
             slot.id,
-            &format!("{} is {status}. Folder: `{}`", slot.name, slot.workdir),
+            &format!(
+                "{} is {}. Folder: `{}`\n{}",
+                slot.name,
+                runtime.label,
+                slot.workdir,
+                codex_usage_text(usage.as_ref())
+            ),
         );
+        return true;
+    }
+    if lower == "usage" || lower == "limits" {
+        let usage = codex_index_snapshot(state).and_then(|index| index.usage);
+        append_agent_assistant(state, slot.id, &codex_usage_text(usage.as_ref()));
         return true;
     }
     if lower == "model" || lower == "settings" {
         append_agent_assistant(
             state,
             slot.id,
-            &format!(
-                "Agent command: `{}` `{}`",
-                state.config.agent_codex_bin,
-                state.config.agent_codex_args.join(" ")
-            ),
+            &format!("Agent command: `{}`", agent_command_label(&state.config)),
         );
         return true;
     }
@@ -1787,6 +2147,7 @@ fn agent_help_text(state: &AppState) -> String {
             "- `!fresh`",
             "- `!stayfresh`",
             "- `!status`",
+            "- `!usage`",
             "- `!stop`",
             "- `!model`",
         ]
@@ -1871,6 +2232,598 @@ fn list_agent_path_text(slot: &AgentSlotRow, arg: &str) -> String {
         target.display(),
         names.join("\n")
     )
+}
+
+fn load_codex_index(config: &Config) -> CodexIndex {
+    let thread_names = load_codex_thread_names(&config.codex_home);
+    let mut files = collect_codex_session_files(&config.codex_home);
+    files.sort_by_key(|path| Reverse(file_modified(path)));
+    files.truncate(CODEX_SESSION_SCAN_LIMIT);
+
+    let mut conversations = files
+        .iter()
+        .filter_map(|path| codex_conversation_from_file(path, &thread_names))
+        .collect::<Vec<_>>();
+    conversations.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    conversations.truncate(MAX_CODEX_CONVERSATIONS);
+
+    let mut projects = configured_codex_projects(&config.codex_home);
+    for conversation in &conversations {
+        projects
+            .entry(conversation.cwd.clone())
+            .and_modify(|project| project.conversation_count += 1)
+            .or_insert_with(|| CodexProject {
+                path: conversation.cwd.clone(),
+                name: project_display_name(&conversation.cwd),
+                trusted: false,
+                conversation_count: 1,
+            });
+    }
+    for project in projects.values_mut() {
+        if project.conversation_count == 0 {
+            project.conversation_count = conversations
+                .iter()
+                .filter(|conversation| conversation.cwd == project.path)
+                .count();
+        }
+    }
+    let mut projects = projects.into_values().collect::<Vec<_>>();
+    projects.sort_by(|left, right| {
+        right
+            .conversation_count
+            .cmp(&left.conversation_count)
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            })
+    });
+
+    let usage = merge_codex_rate_limit_status(latest_codex_usage(&files), &config);
+
+    CodexIndex {
+        usage,
+        conversations,
+        projects,
+    }
+}
+
+fn load_codex_thread_names(codex_home: &Path) -> HashMap<String, (String, String)> {
+    let path = codex_home.join("session_index.jsonl");
+    let Ok(file) = fs::File::open(path) else {
+        return HashMap::new();
+    };
+    let reader = io::BufReader::new(file);
+    let mut names = HashMap::new();
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(id) = value.get("id").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let title = value
+            .get("thread_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("Untitled")
+            .to_string();
+        let updated_at = value
+            .get("updated_at")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string();
+        names.insert(id.to_string(), (title, updated_at));
+    }
+    names
+}
+
+fn collect_codex_session_files(codex_home: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_jsonl_files(&codex_home.join("sessions"), 5, &mut files);
+    let index = codex_home.join("history.jsonl");
+    if index.exists() {
+        files.push(index);
+    }
+    files
+}
+
+fn collect_jsonl_files(dir: &Path, depth: usize, files: &mut Vec<PathBuf>) {
+    if depth == 0 || dir.to_string_lossy().contains("/.tmp/") {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_jsonl_files(&path, depth - 1, files);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            files.push(path);
+        }
+    }
+}
+
+fn codex_conversation_from_file(
+    path: &Path,
+    thread_names: &HashMap<String, (String, String)>,
+) -> Option<CodexConversation> {
+    if path.file_name().and_then(|name| name.to_str()) == Some("history.jsonl") {
+        return None;
+    }
+    let file = fs::File::open(path).ok()?;
+    let reader = io::BufReader::new(file);
+    let mut id = None::<String>;
+    let mut cwd = None::<String>;
+    let mut started_at = None::<String>;
+    let mut updated_at = None::<String>;
+    let mut first_user = None::<String>;
+    let mut last_message = None::<String>;
+    let mut message_count = 0usize;
+
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if let Some(timestamp) = value.get("timestamp").and_then(|value| value.as_str()) {
+            updated_at = Some(timestamp.to_string());
+        }
+        if value.get("type").and_then(|value| value.as_str()) == Some("session_meta") {
+            let payload = value.get("payload").unwrap_or(&serde_json::Value::Null);
+            id = payload
+                .get("id")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            cwd = payload
+                .get("cwd")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            started_at = payload
+                .get("timestamp")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            continue;
+        }
+        let Some((role, text)) = codex_visible_message(&value) else {
+            continue;
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        message_count += 1;
+        if role == "user" && first_user.is_none() {
+            first_user = Some(text.clone());
+        }
+        last_message = Some(text);
+    }
+
+    let id = id?;
+    let cwd = cwd.unwrap_or_else(|| default_home_dir().to_string_lossy().into_owned());
+    let (indexed_title, indexed_updated) = thread_names
+        .get(&id)
+        .cloned()
+        .unwrap_or_else(|| (String::new(), String::new()));
+    let indexed_title = indexed_title.trim();
+    let title = if indexed_title.is_empty() || is_codex_synthetic_user_text(indexed_title) {
+        first_user
+            .as_deref()
+            .map(|value| truncate_text(value, 56))
+            .unwrap_or_else(|| "Untitled Codex conversation".into())
+    } else {
+        indexed_title.to_string()
+    };
+    let updated_at = if !indexed_updated.trim().is_empty() {
+        indexed_updated
+    } else {
+        updated_at
+            .or_else(|| started_at.clone())
+            .unwrap_or_else(|| system_time_to_rfc3339(file_modified(path)))
+    };
+    Some(CodexConversation {
+        id,
+        title,
+        cwd,
+        updated_at,
+        path: path.to_path_buf(),
+        preview: first_user.or(last_message).unwrap_or_default(),
+        message_count,
+    })
+}
+
+fn codex_transcript_messages(path: &Path) -> io::Result<Vec<AgentMessageRow>> {
+    let file = fs::File::open(path)?;
+    let reader = io::BufReader::new(file);
+    let mut rows = Vec::new();
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let timestamp = value
+            .get("timestamp")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string();
+        let Some((role, text)) = codex_visible_message(&value) else {
+            continue;
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        rows.push(AgentMessageRow {
+            role,
+            body: text,
+            created_at: timestamp,
+            attachment: None,
+        });
+    }
+    if rows.len() > MAX_CODEX_TRANSCRIPT_MESSAGES {
+        let start = rows.len() - MAX_CODEX_TRANSCRIPT_MESSAGES;
+        rows = rows.split_off(start);
+    }
+    rows.reverse();
+    Ok(rows)
+}
+
+fn codex_visible_message(value: &serde_json::Value) -> Option<(String, String)> {
+    if value.get("type").and_then(|value| value.as_str()) != Some("response_item") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    if payload.get("type").and_then(|value| value.as_str()) != Some("message") {
+        return None;
+    }
+    let role = payload.get("role").and_then(|value| value.as_str())?;
+    if !matches!(role, "user" | "assistant") {
+        return None;
+    }
+    let text = codex_content_text(payload.get("content")?);
+    if role == "user" && is_codex_synthetic_user_text(&text) {
+        return None;
+    }
+    Some((role.to_string(), text))
+}
+
+fn is_codex_synthetic_user_text(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("# AGENTS.md instructions for")
+        || trimmed.starts_with("<environment_context>")
+        || trimmed.starts_with("<INSTRUCTIONS>")
+        || trimmed.starts_with("<permissions instructions>")
+        || trimmed.starts_with("<collaboration_mode>")
+        || trimmed.starts_with("<apps_instructions>")
+        || trimmed.starts_with("<skills_instructions>")
+        || trimmed.starts_with("<plugins_instructions>")
+        || (trimmed.contains("<environment_context>") && trimmed.contains("<cwd>"))
+}
+
+fn codex_content_text(content: &serde_json::Value) -> String {
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
+    let Some(items) = content.as_array() else {
+        return String::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            item.get("text")
+                .or_else(|| item.get("content"))
+                .and_then(|value| value.as_str())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn latest_codex_usage(files: &[PathBuf]) -> Option<CodexUsageSnapshot> {
+    let mut latest = None::<(String, CodexUsageSnapshot)>;
+    for path in files.iter().take(CODEX_SESSION_SCAN_LIMIT) {
+        let Ok(file) = fs::File::open(path) else {
+            continue;
+        };
+        let reader = io::BufReader::new(file);
+        for line in reader.lines().map_while(Result::ok) {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if value.get("type").and_then(|value| value.as_str()) != Some("event_msg") {
+                continue;
+            }
+            let payload = value.get("payload").unwrap_or(&serde_json::Value::Null);
+            if payload.get("type").and_then(|value| value.as_str()) != Some("token_count") {
+                continue;
+            }
+            let observed_at = value
+                .get("timestamp")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_string();
+            let snapshot = codex_usage_from_payload(&observed_at, payload);
+            if latest
+                .as_ref()
+                .is_none_or(|(timestamp, _)| observed_at.as_str() > timestamp.as_str())
+            {
+                latest = Some((observed_at, snapshot));
+            }
+        }
+    }
+    latest.map(|(_, snapshot)| snapshot)
+}
+
+fn merge_codex_rate_limit_status(
+    usage: Option<CodexUsageSnapshot>,
+    config: &Config,
+) -> Option<CodexUsageSnapshot> {
+    let Some(result) = fetch_codex_rate_limits(config) else {
+        return usage;
+    };
+    let rate_limits = result
+        .get("rateLimits")
+        .or_else(|| result.get("rate_limits"))
+        .unwrap_or(&serde_json::Value::Null);
+    let mut usage = usage.unwrap_or_else(|| CodexUsageSnapshot {
+        observed_at: Utc::now().to_rfc3339(),
+        plan_type: "unknown".into(),
+        total_units: 0,
+        last_units: 0,
+        cached_input_units: 0,
+        context_window: 0,
+        primary: None,
+        secondary: None,
+        credits: None,
+        reset_credits: None,
+    });
+    usage.observed_at = Utc::now().to_rfc3339();
+    if let Some(plan_type) = rate_limits
+        .get("planType")
+        .or_else(|| rate_limits.get("plan_type"))
+        .and_then(|value| value.as_str())
+    {
+        usage.plan_type = plan_type.to_string();
+    }
+    usage.primary = codex_rate_window("Primary", rate_limits.get("primary")).or(usage.primary);
+    usage.secondary =
+        codex_rate_window("Secondary", rate_limits.get("secondary")).or(usage.secondary);
+    usage.credits = codex_credits_text(rate_limits.get("credits")).or(usage.credits);
+    usage.reset_credits = codex_reset_credits_summary(
+        result
+            .get("rateLimitResetCredits")
+            .or_else(|| result.get("rate_limit_reset_credits")),
+    )
+    .or(usage.reset_credits);
+    Some(usage)
+}
+
+fn fetch_codex_rate_limits(config: &Config) -> Option<serde_json::Value> {
+    let initialize = serde_json::json!({
+        "id": 0,
+        "method": "initialize",
+        "params": {
+            "clientInfo": {"name": "plugdeck", "version": env!("CARGO_PKG_VERSION")},
+            "capabilities": {"experimentalApi": true}
+        }
+    });
+    let read_limits = serde_json::json!({
+        "id": 1,
+        "method": "account/rateLimits/read",
+        "params": null
+    });
+    let input = format!("{initialize}\n{{\"method\":\"initialized\"}}\n{read_limits}\n");
+    let output = codex_app_server_request(config, &input)?;
+    output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value.get("id").and_then(|value| value.as_i64()) == Some(1))
+        .and_then(|value| value.get("result").cloned())
+}
+
+fn consume_codex_rate_limit_reset_credit(config: &Config) -> Option<String> {
+    let initialize = serde_json::json!({
+        "id": 0,
+        "method": "initialize",
+        "params": {
+            "clientInfo": {"name": "plugdeck", "version": env!("CARGO_PKG_VERSION")},
+            "capabilities": {"experimentalApi": true}
+        }
+    });
+    let consume = serde_json::json!({
+        "id": 1,
+        "method": "account/rateLimitResetCredit/consume",
+        "params": {"idempotencyKey": Uuid::new_v4().to_string()}
+    });
+    let input = format!("{initialize}\n{{\"method\":\"initialized\"}}\n{consume}\n");
+    let output = codex_app_server_request(config, &input)?;
+    output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value.get("id").and_then(|value| value.as_i64()) == Some(1))
+        .and_then(|value| {
+            value
+                .get("result")
+                .and_then(|result| result.get("outcome"))
+                .and_then(|outcome| outcome.as_str())
+                .map(str::to_string)
+        })
+}
+
+fn codex_app_server_request(config: &Config, input: &str) -> Option<String> {
+    let mut command = StdCommand::new(&config.agent_codex_bin);
+    command
+        .args(&config.agent_codex_args)
+        .arg("app-server")
+        .arg("--stdio")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().ok()?;
+    {
+        let mut stdin = child.stdin.take()?;
+        stdin.write_all(input.as_bytes()).ok()?;
+        stdin.flush().ok()?;
+        std::thread::sleep(CODEX_APP_SERVER_WRITE_SETTLE);
+    }
+    let started = Instant::now();
+    loop {
+        if child.try_wait().ok()?.is_some() {
+            break;
+        }
+        if started.elapsed() >= CODEX_APP_SERVER_TIMEOUT {
+            let _ = child.kill();
+            break;
+        }
+        std::thread::sleep(StdDuration::from_millis(100));
+    }
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() && output.stdout.is_empty() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+fn codex_usage_from_payload(observed_at: &str, payload: &serde_json::Value) -> CodexUsageSnapshot {
+    let info = payload.get("info").unwrap_or(&serde_json::Value::Null);
+    let rate_limits = payload
+        .get("rate_limits")
+        .unwrap_or(&serde_json::Value::Null);
+    let total = info
+        .get("total_token_usage")
+        .unwrap_or(&serde_json::Value::Null);
+    let last = info
+        .get("last_token_usage")
+        .unwrap_or(&serde_json::Value::Null);
+    CodexUsageSnapshot {
+        observed_at: observed_at.to_string(),
+        plan_type: rate_limits
+            .get("plan_type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        total_units: total
+            .get("total_tokens")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0),
+        last_units: last
+            .get("total_tokens")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0),
+        cached_input_units: total
+            .get("cached_input_tokens")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0),
+        context_window: info
+            .get("model_context_window")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0),
+        primary: codex_rate_window("Primary", rate_limits.get("primary")),
+        secondary: codex_rate_window("Secondary", rate_limits.get("secondary")),
+        credits: codex_credits_text(rate_limits.get("credits")),
+        reset_credits: codex_reset_credits_summary(
+            rate_limits
+                .get("rate_limit_reset_credits")
+                .or_else(|| rate_limits.get("rateLimitResetCredits"))
+                .or_else(|| payload.get("rate_limit_reset_credits"))
+                .or_else(|| payload.get("rateLimitResetCredits")),
+        ),
+    }
+}
+
+fn codex_rate_window(label: &str, value: Option<&serde_json::Value>) -> Option<CodexRateWindow> {
+    let value = value?;
+    let used = value
+        .get("used_percent")
+        .or_else(|| value.get("usedPercent"))
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0);
+    Some(CodexRateWindow {
+        label: label.into(),
+        used_percent: used,
+        remaining_percent: (100.0 - used).max(0.0),
+        window_minutes: value
+            .get("window_minutes")
+            .or_else(|| value.get("windowDurationMins"))
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0),
+        resets_at: value
+            .get("resets_at")
+            .or_else(|| value.get("resetsAt"))
+            .and_then(|value| value.as_i64()),
+    })
+}
+
+fn codex_credits_text(value: Option<&serde_json::Value>) -> Option<String> {
+    let value = value?;
+    if value.is_null() {
+        None
+    } else if let Some(text) = value.as_str() {
+        Some(text.to_string())
+    } else if let Some(balance) = value.get("balance").and_then(|value| value.as_str()) {
+        let unlimited = value
+            .get("unlimited")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        if unlimited {
+            Some("unlimited".into())
+        } else {
+            Some(balance.to_string())
+        }
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn codex_reset_credits_summary(
+    value: Option<&serde_json::Value>,
+) -> Option<CodexResetCreditsSummary> {
+    let value = value?;
+    if value.is_null() {
+        return None;
+    }
+    let available_count = value
+        .get("available_count")
+        .or_else(|| value.get("availableCount"))
+        .and_then(|value| value.as_i64())?;
+    Some(CodexResetCreditsSummary {
+        available_count,
+        estimate: None,
+    })
+}
+
+fn configured_codex_projects(codex_home: &Path) -> HashMap<String, CodexProject> {
+    let mut projects = HashMap::new();
+    let Ok(raw) = fs::read_to_string(codex_home.join("config.toml")) else {
+        return projects;
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(&raw) else {
+        return projects;
+    };
+    let Some(table) = value.get("projects").and_then(|value| value.as_table()) else {
+        return projects;
+    };
+    for (path, details) in table {
+        let trusted = details
+            .get("trust_level")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("trusted"));
+        projects.insert(
+            path.to_string(),
+            CodexProject {
+                path: path.to_string(),
+                name: project_display_name(path),
+                trusted,
+                conversation_count: 0,
+            },
+        );
+    }
+    projects
+}
+
+fn codex_conversation_by_id<'a>(
+    index: &'a CodexIndex,
+    thread_id: &str,
+) -> Option<&'a CodexConversation> {
+    index
+        .conversations
+        .iter()
+        .find(|conversation| conversation.id == thread_id)
 }
 
 fn start_agent_job(
@@ -2787,586 +3740,6 @@ fn set_agent_session(
     Ok(())
 }
 
-fn mbx_cmd(args: &[String]) -> io::Result<()> {
-    let command = args.first().map(String::as_str).unwrap_or("");
-    match command {
-        "" | "-h" | "--help" | "help" | "commands" => {
-            print!("{}", mbx_usage());
-            Ok(())
-        }
-        "slots" | "sessions" | "status" => mbx_status(args.get(1).map(String::as_str)),
-        "list" | "ls" => mbx_list_sessions(),
-        "stop" => {
-            let Some(slot) = args.get(1) else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "usage: plugdeck mbx stop <slot|all>",
-                ));
-            };
-            mbx_stop(slot)
-        }
-        "start" | "s" | "new" | "n" | "resume" | "r" => {
-            let Some(slot_name) = args.get(1) else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("usage: plugdeck mbx {command} <slot>"),
-                ));
-            };
-            let action = match command {
-                "new" | "n" => MbxAction::New,
-                "resume" | "r" => MbxAction::Resume,
-                _ => MbxAction::Start,
-            };
-            let options = mbx_parse_run_options(action, &args[2..])?;
-            mbx_run_slot(action, slot_name, options)
-        }
-        slot_name if !normalize_agent_slot_name(slot_name).is_empty() => {
-            let options = mbx_parse_run_options(MbxAction::Resume, &args[1..])?;
-            mbx_run_slot(MbxAction::Resume, slot_name, options)
-        }
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "unknown mbx command; run `plugdeck mbx help`",
-        )),
-    }
-}
-
-fn mbx_usage() -> &'static str {
-    r#"Usage:
-  mbx r <slot> [prompt...]
-  mbx s <slot> [prompt...]
-  mbx n <slot> [prompt...]
-  mbx stop <slot|all>
-  mbx slots [slot]
-  mbx list
-
-Shortcuts:
-  mbx a          same as mbx r a
-  mbx r a        resume slot a's saved /agents thread when present
-  mbx s b        start Codex in slot b's /agents folder
-  mbx n c        restart slot c's tmux session fresh
-
-Options:
-  -C, --cd <dir>     Override the slot folder.
-  --unsafe           Add Codex's bypass approvals/sandbox flag.
-  --safe             Do not add the bypass flag.
-  --restart          Replace an existing tmux session.
-  --no-attach        Start or send without attaching.
-  --dry-run          Print what would run.
-"#
-}
-
-fn mbx_parse_run_options(action: MbxAction, args: &[String]) -> io::Result<MbxRunOptions> {
-    let mut options = MbxRunOptions {
-        workdir: None,
-        prompt: Vec::new(),
-        attach: true,
-        restart: action == MbxAction::New,
-        dry_run: false,
-        unsafe_mode: env_flag("PLUGDECK_MBX_UNSAFE", false),
-    };
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "-h" | "--help" => {
-                print!("{}", mbx_usage());
-                std::process::exit(0);
-            }
-            "-C" | "--cd" | "--dir" => {
-                let Some(path) = args.get(index + 1) else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("{} requires a directory", args[index]),
-                    ));
-                };
-                options.workdir = Some(expand_local_path(path));
-                index += 2;
-            }
-            "--safe" => {
-                options.unsafe_mode = false;
-                index += 1;
-            }
-            "--unsafe" => {
-                options.unsafe_mode = true;
-                index += 1;
-            }
-            "--restart" => {
-                options.restart = true;
-                index += 1;
-            }
-            "--no-attach" => {
-                options.attach = false;
-                index += 1;
-            }
-            "--dry-run" => {
-                options.dry_run = true;
-                index += 1;
-            }
-            "--" => {
-                options.prompt.extend(args[index + 1..].iter().cloned());
-                break;
-            }
-            value if value.starts_with('-') => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unknown mbx option: {value}"),
-                ));
-            }
-            value => {
-                let candidate = expand_local_path(value);
-                if options.workdir.is_none() && candidate.is_dir() {
-                    options.workdir = Some(candidate);
-                } else {
-                    options.prompt.push(value.to_string());
-                }
-                index += 1;
-            }
-        }
-    }
-    Ok(options)
-}
-
-fn mbx_run_slot(action: MbxAction, slot_name: &str, options: MbxRunOptions) -> io::Result<()> {
-    mbx_need_tmux()?;
-    let slot = mbx_find_slot(slot_name)?;
-    let workdir = mbx_resolve_workdir(options.workdir, &slot.workdir)?;
-    let session = mbx_session_name(&slot.name);
-    let codex_bin = env::var("PLUGDECK_AGENT_CODEX_BIN").unwrap_or_else(|_| "codex".into());
-    let codex_args = env::var("PLUGDECK_AGENT_CODEX_ARGS")
-        .ok()
-        .map(|value| split_env_args(&value))
-        .unwrap_or_default();
-    let codex_words = mbx_codex_words(
-        action,
-        &slot,
-        &workdir,
-        &options.prompt,
-        &codex_bin,
-        &codex_args,
-        options.unsafe_mode,
-    );
-    let cmdline = mbx_shell_join(&codex_words);
-    let resumes_saved = action == MbxAction::Resume && slot.thread_id.is_some();
-
-    if options.dry_run {
-        println!("slot:    {}", slot.name);
-        println!("session: {session}");
-        println!("workdir: {}", workdir.display());
-        println!("thread:  {}", if resumes_saved { "saved" } else { "fresh" });
-        println!("command: {cmdline}");
-        return Ok(());
-    }
-
-    if action == MbxAction::Resume && slot.thread_id.is_none() {
-        eprintln!(
-            "mbx: slot {} has no saved /agents thread yet; starting a fresh Codex session",
-            slot.name
-        );
-    }
-
-    if mbx_has_session(&session) {
-        if action == MbxAction::New || options.restart {
-            mbx_kill_session(&session)?;
-        } else {
-            if mbx_session_is_idle_shell(&session) {
-                mbx_send_keys(&session, &cmdline)?;
-            }
-            if options.attach {
-                return mbx_attach_session(&session);
-            }
-            println!("Sent to {} ({session})", slot.name);
-            return Ok(());
-        }
-    }
-
-    mbx_new_session(&session, &workdir)?;
-    mbx_send_keys(&session, &cmdline)?;
-    if options.attach {
-        mbx_attach_session(&session)?;
-    } else {
-        println!("Started {} ({session})", slot.name);
-    }
-    Ok(())
-}
-
-fn mbx_find_slot(raw_name: &str) -> io::Result<MbxSlot> {
-    let name = normalize_agent_slot_name(raw_name);
-    if name.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid slot name: {raw_name}"),
-        ));
-    }
-    let slots = mbx_load_slots()?;
-    slots
-        .iter()
-        .find(|slot| slot.name.eq_ignore_ascii_case(&name))
-        .cloned()
-        .ok_or_else(|| {
-            let names = slots
-                .iter()
-                .map(|slot| slot.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("unknown /agents slot `{name}`; available: {names}"),
-            )
-        })
-}
-
-fn mbx_load_slots() -> io::Result<Vec<MbxSlot>> {
-    let db_path = mbx_db_path();
-    if !db_path.exists() {
-        return Ok(mbx_default_slots());
-    }
-    let db = Connection::open(&db_path).map_err(io_other)?;
-    let mut stmt = db
-        .prepare(
-            "SELECT s.id, s.name, s.workdir, sessions.thread_id
-             FROM agent_slots s
-             LEFT JOIN agent_sessions sessions ON sessions.slot_id = s.id
-             ORDER BY s.id ASC",
-        )
-        .map_err(io_other)?;
-    let slots = stmt
-        .query_map([], |row| {
-            Ok(MbxSlot {
-                id: Some(row.get(0)?),
-                name: row.get(1)?,
-                workdir: row.get(2)?,
-                thread_id: row.get(3)?,
-            })
-        })
-        .map_err(io_other)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(io_other)?;
-    if slots.is_empty() {
-        Ok(mbx_default_slots())
-    } else {
-        Ok(slots)
-    }
-}
-
-fn mbx_default_slots() -> Vec<MbxSlot> {
-    let default_workdir = env::var("PLUGDECK_AGENT_DEFAULT_WORKDIR")
-        .map(|value| expand_local_path(&value))
-        .unwrap_or_else(|_| default_home_dir());
-    let mut seeds = parse_agent_slot_seeds(env::var("PLUGDECK_AGENT_SLOTS").ok(), &default_workdir);
-    if seeds.is_empty() {
-        seeds = parse_agent_slot_seeds(None, &default_workdir);
-    }
-    seeds
-        .into_iter()
-        .map(|seed| MbxSlot {
-            id: None,
-            name: seed.name,
-            workdir: seed.workdir.to_string_lossy().into_owned(),
-            thread_id: None,
-        })
-        .collect()
-}
-
-fn mbx_db_path() -> PathBuf {
-    env::var("PLUGDECK_DB")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("data/plugdeck.sqlite"))
-}
-
-fn mbx_resolve_workdir(override_path: Option<PathBuf>, slot_workdir: &str) -> io::Result<PathBuf> {
-    let path = override_path.unwrap_or_else(|| expand_local_path(slot_workdir));
-    if !path.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("slot folder does not exist: {}", path.display()),
-        ));
-    }
-    path.canonicalize()
-}
-
-fn mbx_codex_words(
-    action: MbxAction,
-    slot: &MbxSlot,
-    workdir: &Path,
-    prompt: &[String],
-    codex_bin: &str,
-    codex_args: &[String],
-    unsafe_mode: bool,
-) -> Vec<String> {
-    let mut words = vec![codex_bin.to_string()];
-    if unsafe_mode {
-        words.push("--dangerously-bypass-approvals-and-sandbox".into());
-    }
-    words.extend(codex_args.iter().cloned());
-    words.push("--cd".into());
-    words.push(workdir.to_string_lossy().into_owned());
-    if action == MbxAction::Resume
-        && let Some(thread_id) = &slot.thread_id
-    {
-        words.push("resume".into());
-        words.push(thread_id.clone());
-    }
-    if !prompt.is_empty() {
-        words.push(prompt.join(" "));
-    }
-    words
-}
-
-fn mbx_status(requested: Option<&str>) -> io::Result<()> {
-    let mut slots = mbx_load_slots()?;
-    if let Some(name) = requested {
-        let normalized = normalize_agent_slot_name(name);
-        slots.retain(|slot| slot.name.eq_ignore_ascii_case(&normalized));
-    }
-    if slots.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "no matching /agents slots",
-        ));
-    }
-    println!(
-        "{:<6} {:<5} {:<10} {:<13} {:<14} path",
-        "slot", "id", "thread", "tmux", "session"
-    );
-    for slot in slots {
-        let session = mbx_session_name(&slot.name);
-        let tmux = mbx_tmux_state(&session).unwrap_or_else(|| "available".into());
-        println!(
-            "{:<6} {:<5} {:<10} {:<13} {:<14} {}",
-            slot.name,
-            slot.id
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "-".into()),
-            if slot.thread_id.is_some() {
-                "saved"
-            } else {
-                "-"
-            },
-            tmux,
-            session,
-            slot.workdir
-        );
-    }
-    Ok(())
-}
-
-fn mbx_list_sessions() -> io::Result<()> {
-    mbx_need_tmux()?;
-    let prefix = mbx_session_prefix();
-    let output = StdCommand::new("tmux")
-        .args(["list-sessions", "-F", "#{session_name}|#{session_attached}"])
-        .output();
-    let Ok(output) = output else {
-        println!("No mbx sessions are running.");
-        return Ok(());
-    };
-    let lines = String::from_utf8_lossy(&output.stdout);
-    let mut found = false;
-    for line in lines.lines() {
-        let Some((session, attached)) = line.split_once('|') else {
-            continue;
-        };
-        if !session.starts_with(&format!("{prefix}-")) {
-            continue;
-        }
-        found = true;
-        let state = if attached == "1" {
-            "attached"
-        } else {
-            "detached"
-        };
-        println!("{session}\t{state}");
-    }
-    if !found {
-        println!("No mbx sessions are running.");
-    }
-    Ok(())
-}
-
-fn mbx_stop(slot_name: &str) -> io::Result<()> {
-    mbx_need_tmux()?;
-    if slot_name == "all" {
-        let prefix = mbx_session_prefix();
-        let output = StdCommand::new("tmux")
-            .args(["list-sessions", "-F", "#{session_name}"])
-            .output();
-        let Ok(output) = output else {
-            println!("No mbx sessions are running.");
-            return Ok(());
-        };
-        let mut found = false;
-        for session in String::from_utf8_lossy(&output.stdout).lines() {
-            if session.starts_with(&format!("{prefix}-")) {
-                mbx_kill_session(session)?;
-                println!("Stopped {session}");
-                found = true;
-            }
-        }
-        if !found {
-            println!("No mbx sessions are running.");
-        }
-        return Ok(());
-    }
-    let slot = mbx_find_slot(slot_name)?;
-    let session = mbx_session_name(&slot.name);
-    if mbx_has_session(&session) {
-        mbx_kill_session(&session)?;
-        println!("Stopped {} ({session})", slot.name);
-    } else {
-        println!("{} is not running.", slot.name);
-    }
-    Ok(())
-}
-
-fn mbx_need_tmux() -> io::Result<()> {
-    let status = StdCommand::new("tmux")
-        .arg("-V")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    match status {
-        Ok(status) if status.success() => Ok(()),
-        _ => Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "tmux is not installed or not on PATH",
-        )),
-    }
-}
-
-fn mbx_session_name(slot_name: &str) -> String {
-    format!("{}-{}", mbx_session_prefix(), slot_name)
-}
-
-fn mbx_session_prefix() -> String {
-    env::var("PLUGDECK_MBX_SESSION_PREFIX").unwrap_or_else(|_| "plugdeck".into())
-}
-
-fn mbx_has_session(session: &str) -> bool {
-    matches!(
-        StdCommand::new("tmux")
-            .args(["has-session", "-t", session])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status(),
-        Ok(status) if status.success()
-    )
-}
-
-fn mbx_new_session(session: &str, workdir: &Path) -> io::Result<()> {
-    let status = StdCommand::new("tmux")
-        .args(["new-session", "-d", "-s", session, "-n", session, "-c"])
-        .arg(workdir)
-        .status()?;
-    if !status.success() {
-        return Err(io::Error::other(format!(
-            "could not create tmux session {session}"
-        )));
-    }
-    let _ = StdCommand::new("tmux")
-        .args(["set-option", "-t", session, "remain-on-exit", "on"])
-        .status();
-    Ok(())
-}
-
-fn mbx_kill_session(session: &str) -> io::Result<()> {
-    let status = StdCommand::new("tmux")
-        .args(["kill-session", "-t", session])
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "could not stop tmux session {session}"
-        )))
-    }
-}
-
-fn mbx_send_keys(session: &str, cmdline: &str) -> io::Result<()> {
-    let status = StdCommand::new("tmux")
-        .args(["send-keys", "-t", session])
-        .arg(cmdline)
-        .arg("C-m")
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "could not send command to tmux session {session}"
-        )))
-    }
-}
-
-fn mbx_attach_session(session: &str) -> io::Result<()> {
-    let mut command = StdCommand::new("tmux");
-    if env::var_os("TMUX").is_some() {
-        command.args(["switch-client", "-t", session]);
-    } else {
-        command.args(["attach-session", "-t", session]);
-    }
-    let status = command.status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "could not attach tmux session {session}"
-        )))
-    }
-}
-
-fn mbx_session_is_idle_shell(session: &str) -> bool {
-    let Some(command) = mbx_pane_current_command(session) else {
-        return false;
-    };
-    matches!(command.as_str(), "bash" | "zsh" | "fish" | "sh")
-}
-
-fn mbx_tmux_state(session: &str) -> Option<String> {
-    if !mbx_has_session(session) {
-        return None;
-    }
-    let attached = mbx_tmux_format(session, "#{session_attached}")?;
-    Some(if attached.trim() == "1" {
-        "attached".into()
-    } else {
-        "detached".into()
-    })
-}
-
-fn mbx_pane_current_command(session: &str) -> Option<String> {
-    mbx_tmux_format(session, "#{pane_current_command}")
-}
-
-fn mbx_tmux_format(session: &str, format: &str) -> Option<String> {
-    let output = StdCommand::new("tmux")
-        .args(["display-message", "-p", "-t", session, format])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn mbx_shell_join(words: &[String]) -> String {
-    words
-        .iter()
-        .map(|word| mbx_shell_quote(word))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn mbx_shell_quote(value: &str) -> String {
-    if !value.is_empty()
-        && value.chars().all(|ch| {
-            ch.is_ascii_alphanumeric()
-                || matches!(ch, '/' | '.' | '_' | '-' | ':' | '=' | ',' | '@' | '%')
-        })
-    {
-        return value.to_string();
-    }
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
 fn build_agent_prompt(
     slot: &AgentSlotRow,
     request_body: &str,
@@ -3441,6 +3814,34 @@ fn expand_local_path(value: &str) -> PathBuf {
     PathBuf::from(trimmed)
 }
 
+fn default_codex_bin() -> String {
+    if command_in_path("codexunsafe") {
+        "codexunsafe".into()
+    } else {
+        let user_alias = default_home_dir().join(".local/bin/codexunsafe");
+        if user_alias.is_file() {
+            user_alias.to_string_lossy().into_owned()
+        } else {
+            "codex".into()
+        }
+    }
+}
+
+fn command_in_path(command: &str) -> bool {
+    if command.contains('/') {
+        return Path::new(command).is_file();
+    }
+    env::var_os("PATH")
+        .map(|paths| env::split_paths(&paths).any(|path| path.join(command).is_file()))
+        .unwrap_or(false)
+}
+
+fn agent_command_label(config: &Config) -> String {
+    let mut parts = vec![config.agent_codex_bin.clone()];
+    parts.extend(config.agent_codex_args.iter().cloned());
+    parts.join(" ")
+}
+
 fn split_env_args(value: &str) -> Vec<String> {
     value
         .split_whitespace()
@@ -3501,6 +3902,93 @@ fn sanitize_filename(value: &str) -> String {
     }
 }
 
+fn project_display_name(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "/".into();
+    }
+    Path::new(trimmed)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+fn url_encode(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+fn file_modified(path: &Path) -> SystemTime {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(std::time::UNIX_EPOCH)
+}
+
+fn system_time_to_rfc3339(value: SystemTime) -> String {
+    DateTime::<Utc>::from(value).to_rfc3339()
+}
+
+fn epoch_to_rfc3339(epoch: i64) -> Option<String> {
+    DateTime::<Utc>::from_timestamp(epoch, 0).map(|value| value.to_rfc3339())
+}
+
+fn short_time(value: &str) -> String {
+    let Ok(parsed) = DateTime::parse_from_rfc3339(value) else {
+        return if value.trim().is_empty() {
+            "unknown".into()
+        } else {
+            value.to_string()
+        };
+    };
+    let dt = parsed.with_timezone(&Utc);
+    let now = Utc::now();
+    let delta = dt - now;
+    let past = now - dt;
+    if delta.num_minutes() > 0 {
+        return format_duration(delta.num_seconds(), "in ");
+    }
+    if past.num_minutes() < 1 {
+        return "just now".into();
+    }
+    if past.num_days() < 2 {
+        return format_duration(past.num_seconds(), "") + " ago";
+    }
+    dt.format("%b %-d %H:%M").to_string()
+}
+
+fn format_duration(seconds: i64, prefix: &str) -> String {
+    let seconds = seconds.max(0);
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{prefix}{minutes}m");
+    }
+    let hours = minutes / 60;
+    if hours < 48 {
+        return format!("{prefix}{hours}h");
+    }
+    format!("{prefix}{}d", hours / 24)
+}
+
+fn format_number(value: i64) -> String {
+    let mut digits = value.abs().to_string();
+    let mut out = String::new();
+    while digits.len() > 3 {
+        let tail = digits.split_off(digits.len() - 3);
+        if out.is_empty() {
+            out = tail;
+        } else {
+            out = format!("{tail},{out}");
+        }
+    }
+    if out.is_empty() {
+        out = digits;
+    } else {
+        out = format!("{digits},{out}");
+    }
+    if value < 0 { format!("-{out}") } else { out }
+}
+
 fn truncate_text(value: &str, max_chars: usize) -> String {
     let value = value.trim();
     if value.chars().count() <= max_chars {
@@ -3508,93 +3996,6 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
     }
     let keep = max_chars.saturating_sub(20);
     value.chars().take(keep).collect::<String>() + "\n...[truncated]"
-}
-
-fn import_motehold(target: &Connection, source_path: &Path) -> io::Result<usize> {
-    let source = Connection::open(source_path).map_err(io_other)?;
-    let mut imported = 0usize;
-    let channels = source
-        .prepare("SELECT id, name, created_at FROM channels ORDER BY id ASC")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()
-        })
-        .map_err(io_other)?;
-    let mut channel_map = HashMap::new();
-    for (old_id, name, created_at) in channels {
-        let existing = target
-            .query_row(
-                "SELECT id FROM channels WHERE name = ?1",
-                params![name],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(io_other)?;
-        let new_id = if let Some(id) = existing {
-            id
-        } else {
-            target
-                .execute(
-                    "INSERT INTO channels (name, created_at) VALUES (?1, ?2)",
-                    params![name, created_at],
-                )
-                .map_err(io_other)?;
-            target.last_insert_rowid()
-        };
-        channel_map.insert(old_id, new_id);
-    }
-    let default_id = ensure_channel(target, DEFAULT_CHANNEL).map_err(io_other)?;
-    let mut stmt = source
-        .prepare(
-            "SELECT id, channel_id, body, image_type, image_data, created_at FROM messages ORDER BY id ASC",
-        )
-        .map_err(io_other)?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<i64>>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<Vec<u8>>>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        })
-        .map_err(io_other)?;
-    for row in rows {
-        let (old_id, old_channel, body, image_type, image_data, created_at) =
-            row.map_err(io_other)?;
-        let source_key = format!("motehold:{}", old_id);
-        let already = target
-            .query_row(
-                "SELECT 1 FROM notes WHERE import_source = ?1",
-                params![source_key],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(io_other)?
-            .is_some();
-        if already {
-            continue;
-        }
-        let channel_id = old_channel
-            .and_then(|id| channel_map.get(&id).copied())
-            .unwrap_or(default_id);
-        target
-            .execute(
-                "INSERT INTO notes (channel_id, body, image_type, image_data, created_at, import_source) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![channel_id, body, image_type, image_data, created_at, source_key],
-            )
-            .map_err(io_other)?;
-        imported += 1;
-    }
-    Ok(imported)
 }
 
 fn render_links(links: &[Link]) -> String {
@@ -3633,7 +4034,7 @@ fn page(title: &str, body: &str) -> Response {
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <title>{}</title>
 <style>
 {PAGE_CSS}
@@ -4155,6 +4556,8 @@ mod tests {
             agent_upload_dir: PathBuf::new(),
             agent_codex_bin: "codex".into(),
             agent_codex_args: Vec::new(),
+            codex_home: PathBuf::new(),
+            codex_reset_command: None,
             agent_slots: Vec::new(),
             ytdlp: "yt-dlp".into(),
             js_runtime: None,
@@ -4198,68 +4601,107 @@ mod tests {
     }
 
     #[test]
-    fn mbx_resume_uses_saved_agent_thread() {
-        let slot = MbxSlot {
-            id: Some(1),
-            name: "a".into(),
-            workdir: "/work".into(),
-            thread_id: Some("thread-123".into()),
-        };
-        let words = mbx_codex_words(
-            MbxAction::Resume,
-            &slot,
-            Path::new("/work"),
-            &["hello".into()],
-            "codex",
-            &["--search".into()],
-            false,
+    fn codex_conversation_parser_uses_index_title_and_visible_messages() {
+        let dir = env::temp_dir().join(format!("plugdeck-test-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout-2026-06-23T09-24-22-thread-1.jsonl");
+        fs::write(
+            &path,
+            r#"{"timestamp":"2026-06-23T07:24:22Z","type":"session_meta","payload":{"id":"thread-1","cwd":"/work/app","timestamp":"2026-06-23T07:24:22Z"}}
+{"timestamp":"2026-06-23T07:24:23Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"secret instructions"}]}}
+{"timestamp":"2026-06-23T07:24:24Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"load this project"}]}}
+{"timestamp":"2026-06-23T07:24:25Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}
+"#,
+        )
+        .unwrap();
+        let mut names = HashMap::new();
+        names.insert(
+            "thread-1".into(),
+            ("Indexed title".into(), "2026-06-23T07:30:00Z".into()),
         );
-        assert_eq!(
-            words,
-            vec![
-                "codex",
-                "--search",
-                "--cd",
-                "/work",
-                "resume",
-                "thread-123",
-                "hello"
-            ]
-        );
+        let conversation = codex_conversation_from_file(&path, &names).unwrap();
+        assert_eq!(conversation.title, "Indexed title");
+        assert_eq!(conversation.cwd, "/work/app");
+        assert_eq!(conversation.message_count, 2);
+        assert_eq!(conversation.preview, "load this project");
+
+        let messages = codex_transcript_messages(&path).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "assistant");
+        assert_eq!(messages[1].role, "user");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn mbx_resume_without_thread_starts_fresh() {
-        let slot = MbxSlot {
-            id: Some(1),
-            name: "a".into(),
-            workdir: "/work".into(),
-            thread_id: None,
-        };
-        let words = mbx_codex_words(
-            MbxAction::Resume,
-            &slot,
-            Path::new("/work"),
-            &[],
-            "codex",
-            &[],
-            true,
+    fn codex_conversation_parser_filters_synthetic_codex_context() {
+        let dir = env::temp_dir().join(format!("plugdeck-test-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout-2026-06-23T09-24-22-thread-2.jsonl");
+        fs::write(
+            &path,
+            r##"{"timestamp":"2026-06-23T07:24:22Z","type":"session_meta","payload":{"id":"thread-2","cwd":"/work/app","timestamp":"2026-06-23T07:24:22Z"}}
+{"timestamp":"2026-06-23T07:24:23Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /work/app"}]}}
+{"timestamp":"2026-06-23T07:24:24Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fix plugdeck loading"}]}}
+{"timestamp":"2026-06-23T07:24:25Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}
+"##,
+        )
+        .unwrap();
+        let mut names = HashMap::new();
+        names.insert(
+            "thread-2".into(),
+            (
+                "# AGENTS.md instructions for /work/app".into(),
+                "2026-06-23T07:30:00Z".into(),
+            ),
         );
-        assert_eq!(
-            words,
-            vec![
-                "codex",
-                "--dangerously-bypass-approvals-and-sandbox",
-                "--cd",
-                "/work"
-            ]
-        );
+        let conversation = codex_conversation_from_file(&path, &names).unwrap();
+        assert_eq!(conversation.title, "fix plugdeck loading");
+        assert_eq!(conversation.preview, "fix plugdeck loading");
+        assert_eq!(conversation.message_count, 2);
+
+        let messages = codex_transcript_messages(&path).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "assistant");
+        assert_eq!(messages[1].role, "user");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn mbx_shell_quote_handles_spaces_and_quotes() {
-        assert_eq!(mbx_shell_quote("/tmp/repo"), "/tmp/repo");
-        assert_eq!(mbx_shell_quote("hello world"), "'hello world'");
-        assert_eq!(mbx_shell_quote("don't"), "'don'\\''t'");
+    fn codex_usage_parser_reads_rate_limits() {
+        let payload = serde_json::json!({
+            "type": "token_count",
+            "info": {
+                "total_token_usage": {
+                    "total_tokens": 619644,
+                    "cached_input_tokens": 528640
+                },
+                "last_token_usage": {"total_tokens": 109315},
+                "model_context_window": 258400
+            },
+            "rate_limits": {
+                "primary": {"used_percent": 14.0, "window_minutes": 300, "resets_at": 1782210186},
+                "secondary": {"used_percent": 38.0, "window_minutes": 10080, "resets_at": 1782380596},
+                "rate_limit_reset_credits": {"available_count": 2},
+                "credits": null,
+                "plan_type": "prolite"
+            }
+        });
+        let usage = codex_usage_from_payload("2026-06-23T07:29:57Z", &payload);
+        assert_eq!(usage.plan_type, "prolite");
+        assert_eq!(usage.total_units, 619644);
+        assert_eq!(usage.last_units, 109315);
+        assert_eq!(usage.primary.unwrap().remaining_percent, 86.0);
+        assert_eq!(usage.secondary.unwrap().remaining_percent, 62.0);
+        assert_eq!(usage.reset_credits.unwrap().available_count, 2);
+
+        let window = serde_json::json!({
+            "usedPercent": 35,
+            "windowDurationMins": 300,
+            "resetsAt": 1782210186
+        });
+        let window = codex_rate_window("Primary", Some(&window)).unwrap();
+        assert_eq!(window.used_percent, 35.0);
+        assert_eq!(window.window_minutes, 300);
+        assert_eq!(window.resets_at, Some(1782210186));
     }
 }
