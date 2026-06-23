@@ -1,0 +1,21 @@
+[Unit]
+Description=Plugdeck private tool hub
+After=network-online.target tailscale-online.target
+Wants=network-online.target tailscale-online.target
+
+[Service]
+Type=simple
+User=plugroot
+Group=plugroot
+WorkingDirectory=/var/lib/plugroot/services/plugdeck
+EnvironmentFile=/var/lib/plugroot/.env
+ExecStart=/var/lib/plugroot/releases/plugdeck/current/plugdeck serve
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/plugroot/services/plugdeck /var/lib/plugroot/media/inbox/plugdeck-downloads
+
+[Install]
+WantedBy=multi-user.target
